@@ -20,7 +20,7 @@
  */
 
 /* Cells along one chunk edge (XZ). Tunable; bounds GPU buffer sizes. */
-#define CHUNK_CELLS 32u
+#define CHUNK_CELLS 24u
 
 /* Number of LOD levels (0 = finest). */
 #define CHUNK_LOD_COUNT 3u

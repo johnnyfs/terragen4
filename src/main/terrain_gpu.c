@@ -168,7 +168,11 @@ terrain_gpu_init(SDL_GPUDevice *device, const TerrainRegionConfig *config, const
     pipeline->config = *config;
     pipeline->layout = *layout;
     pipeline->cell_count = (uint32_t)grid->count;
-    pipeline->max_vertices = pipeline->cell_count * 6u;
+    /* Budget vertices by owned surface area with headroom for a few stacked
+     * surface layers (overhangs). The mesh shader guards against overflow, so a
+     * tight bound only risks dropping triangles in pathologically noisy cells. */
+    const uint32_t owned_area = (uint32_t)(layout->owned_dim_x * layout->owned_dim_z);
+    pipeline->max_vertices = owned_area > 0u ? owned_area * 72u : 6u;
 
     pipeline->sample_pipeline = create_compute_pipeline(
         device,
@@ -242,6 +246,19 @@ terrain_gpu_init(SDL_GPUDevice *device, const TerrainRegionConfig *config, const
         pipeline->cell_count,
         pipeline->max_vertices
     );
+    return true;
+}
+
+bool
+terrain_gpu_reuse(TerrainGpuPipeline *pipeline, const ChunkLayout *layout, uint32_t cell_count) {
+    if (pipeline->sample_pipeline == NULL || pipeline->cell_count != cell_count) {
+        return false;
+    }
+    /* Only the origin (and other uniform-only fields) change between chunks of
+     * the same LOD; the uploaded local coordinates are identical. */
+    pipeline->layout = *layout;
+    const uint32_t owned_area = (uint32_t)(layout->owned_dim_x * layout->owned_dim_z);
+    pipeline->max_vertices = owned_area > 0u ? owned_area * 72u : 6u;
     return true;
 }
 

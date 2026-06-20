@@ -70,3 +70,14 @@ target_compile_options(chunk_coord_tests PUBLIC -std=c23 -Wall -Wfloat-conversio
 target_include_directories(chunk_coord_tests PUBLIC src/main)
 target_link_libraries(chunk_coord_tests m)
 add_test(NAME chunk_coord_tests COMMAND chunk_coord_tests)
+
+add_executable(chunk_cache_tests
+    src/test/chunk_cache_tests.c
+    src/main/chunk_cache.c
+    src/main/chunk_coord.c
+    src/main/terrain_config.c
+)
+target_compile_options(chunk_cache_tests PUBLIC -std=c23 -Wall -Wfloat-conversion)
+target_include_directories(chunk_cache_tests PUBLIC src/main)
+target_link_libraries(chunk_cache_tests m)
+add_test(NAME chunk_cache_tests COMMAND chunk_cache_tests)

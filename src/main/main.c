@@ -5,6 +5,8 @@
 
 #include <log.h>
 
+#include "chunk_cache.h"
+#include "chunk_coord.h"
 #include "sparse_grid.h"
 #include "terrain_config.h"
 #include "terrain_gpu.h"
@@ -27,9 +29,13 @@ typedef struct HudVertex {
 } HudVertex;
 
 #define HUD_MAX_VERTICES 49152u
-#define TERRAIN_WORLD_SIZE 64.0f
-#define TERRAIN_MIN_DETAIL 16u
-#define TERRAIN_MAX_DETAIL 128u
+
+/* Chunk system runtime budget (tunable). Resident memory ~= pool capacity x
+ * per-chunk buffers, so the pool caps how many chunks stay live at once. */
+#define CHUNK_POOL_CAPACITY 160u
+#define CHUNK_ACTIVE_RADIUS 4
+#define CHUNK_MAX_GEN_PER_FRAME 6u
+#define CHUNK_MAX_ACTIVE 4096u
 
 typedef struct AppState {
     SDL_Window *window;
@@ -44,14 +50,28 @@ typedef struct AppState {
     uint32_t hud_vertex_count;
 
     TerrainRegionConfig terrain_config;
-    SparseGrid sparse_grid;
-    TerrainGpuPipeline terrain;
+
+    /* Chunk system: a pool of GPU pipelines indexed by cache record slots. */
+    ChunkCache chunk_cache;
+    TerrainGpuPipeline *chunk_pool;
+    uint32_t density_version;
+    ChunkGenKey active_keys[CHUNK_MAX_ACTIVE];
+    size_t active_count;
+
+    /* Debug counters, refreshed each frame. */
+    uint32_t dbg_active;
+    uint32_t dbg_rendered;
+    uint32_t dbg_hits;
+    uint32_t dbg_misses;
+    uint32_t dbg_evictions;
+    uint32_t dbg_generated;
+    uint32_t dbg_failed;
+
     uint32_t frame_count;
     uint32_t smoke_frame_limit;
     uint64_t last_frame_ticks;
     float fps;
     float last_regen_ms;
-    uint32_t terrain_detail;
 
     float camera_position[3];
     float camera_yaw;
@@ -658,48 +678,164 @@ ensure_depth_texture(AppState *state, uint32_t width, uint32_t height) {
     return true;
 }
 
-/* Phase 2 scaffolding: build one chunk at its true world position. The cache /
- * pool / per-frame selection that manages many chunks arrives in Phase 3. */
-static bool
-build_single_chunk(AppState *state, int32_t cx, int32_t cz, uint32_t lod) {
-    if (!sparse_grid_create_chunk(&state->sparse_grid, &state->terrain_config, lod, cx, cz)) {
-        log_error("Could not create chunk sparse grid");
-        return false;
-    }
-    const ChunkLayout layout = sparse_grid_chunk_layout(&state->terrain_config, lod, cx, cz);
-    if (!terrain_gpu_init(state->device, &state->terrain_config, &state->sparse_grid, &layout, &state->terrain)) {
-        return false;
-    }
-
-    SDL_GPUCommandBuffer *command_buffer = SDL_AcquireGPUCommandBuffer(state->device);
-    terrain_gpu_generate(command_buffer, &state->terrain);
-    SDL_SubmitGPUCommandBuffer(command_buffer);
-    return true;
-}
-
 static bool
 initialize_terrain(AppState *state) {
     state->terrain_config = terrain_default_region_config();
-    state->terrain_detail = state->terrain_config.size_x;
-    return build_single_chunk(state, 0, 0, 0u);
-}
+    state->density_version = 1u;
 
-static bool
-regenerate_terrain(AppState *state) {
-    const uint64_t start = SDL_GetPerformanceCounter();
-    const uint64_t frequency = SDL_GetPerformanceFrequency();
-
-    SDL_WaitForGPUIdle(state->device);
-    terrain_gpu_destroy(state->device, &state->terrain);
-    sparse_grid_destroy(&state->sparse_grid);
-
-    if (!build_single_chunk(state, 0, 0, 0u)) {
+    state->chunk_pool = calloc(CHUNK_POOL_CAPACITY, sizeof(*state->chunk_pool));
+    if (state->chunk_pool == NULL) {
+        log_error("Could not allocate chunk pipeline pool");
+        return false;
+    }
+    if (!chunk_cache_init(&state->chunk_cache, CHUNK_POOL_CAPACITY)) {
+        log_error("Could not initialise chunk cache");
         return false;
     }
 
-    const uint64_t end = SDL_GetPerformanceCounter();
-    state->last_regen_ms = (float)((double)(end - start) * 1000.0 / (double)frequency);
+    log_info(
+        "Chunk world: %d x %d region, %u cells/chunk, pool %u",
+        (int)chunk_count_per_axis(0u),
+        (int)chunk_count_per_axis(0u),
+        (unsigned)CHUNK_CELLS,
+        (unsigned)CHUNK_POOL_CAPACITY
+    );
     return true;
+}
+
+static void
+chunk_key_center(ChunkGenKey key, float *out_x, float *out_z) {
+    const ChunkCoord c = {.cx = key.cx, .cz = key.cz, .lod = key.lod};
+    const ChunkAabb2 b = chunk_bounds(c);
+    *out_x = (b.min_x + b.max_x) * 0.5f;
+    *out_z = (b.min_z + b.max_z) * 0.5f;
+}
+
+/* Generate (or repoint+regenerate) the chunk for rec into its pool slot. */
+static bool
+generate_chunk(AppState *state, SDL_GPUCommandBuffer *command_buffer, ChunkRecord *rec) {
+    const ChunkGenKey key = rec->key;
+    TerrainGpuPipeline *pipe = &state->chunk_pool[rec->slot];
+    const ChunkLayout layout = sparse_grid_chunk_layout(&state->terrain_config, key.lod, key.cx, key.cz);
+    const uint32_t cell_count =
+        (uint32_t)(layout.array_dim_x * layout.array_dim_y * layout.array_dim_z);
+
+    if (!terrain_gpu_reuse(pipe, &layout, cell_count)) {
+        /* The slot held a different-sized chunk (or none): rebuild its buffers.
+         * Same-LOD reuse above keeps the common case allocation-free. */
+        if (pipe->sample_pipeline != NULL) {
+            terrain_gpu_destroy(state->device, pipe);
+        }
+        SparseGrid grid = {0};
+        if (!sparse_grid_create_chunk(&grid, &state->terrain_config, key.lod, key.cx, key.cz)) {
+            return false;
+        }
+        const bool ok = terrain_gpu_init(state->device, &state->terrain_config, &grid, &layout, pipe);
+        sparse_grid_destroy(&grid);
+        if (!ok) {
+            return false;
+        }
+    }
+
+    rec->mem_estimate =
+        (size_t)cell_count * (sizeof(SparseGridCoord) + 96u) +
+        (size_t)pipe->max_vertices * sizeof(TerrainMeshVertex);
+    terrain_gpu_generate(command_buffer, pipe);
+    return true;
+}
+
+/*
+ * Per-frame chunk selection and generation. Computes the active set around the
+ * POV, reuses resident chunks, enqueues missing ones (evicting far/stale chunks
+ * when the pool is full), and generates up to a budget into a dedicated command
+ * buffer submitted before the frame's render pass.
+ */
+static void
+chunk_system_update(AppState *state) {
+    const float pov_x = state->camera_position[0];
+    const float pov_z = state->camera_position[2];
+
+    state->active_count = chunk_active_set_single_lod(
+        pov_x, pov_z, 0u, CHUNK_ACTIVE_RADIUS, CHUNK_REGION_TEST,
+        state->density_version, 1u, 1u, state->active_keys, CHUNK_MAX_ACTIVE
+    );
+
+    state->dbg_active = (uint32_t)state->active_count;
+    state->dbg_hits = 0u;
+    state->dbg_misses = 0u;
+    state->dbg_evictions = 0u;
+    state->dbg_generated = 0u;
+
+    for (size_t i = 0u; i < state->active_count; i += 1u) {
+        const ChunkGenKey key = state->active_keys[i];
+        ChunkRecord *rec = chunk_cache_find(&state->chunk_cache, &key);
+        if (rec != NULL) {
+            rec->last_used_frame = state->frame_count;
+            if (rec->status == CHUNK_STATUS_READY) {
+                state->dbg_hits += 1u;
+            }
+            continue;
+        }
+
+        state->dbg_misses += 1u;
+        if (chunk_cache_free_slots(&state->chunk_cache) == 0u) {
+            ChunkRecord *victim = chunk_cache_pick_eviction(
+                &state->chunk_cache, state->active_keys, state->active_count, pov_x, pov_z
+            );
+            if (victim != NULL) {
+                /* Keep the pool pipeline allocated; only the record is freed so
+                 * the slot's buffers can be reused by the next same-LOD chunk. */
+                chunk_cache_remove(&state->chunk_cache, &victim->key);
+                state->dbg_evictions += 1u;
+            }
+        }
+
+        float cx = 0.0f;
+        float cz = 0.0f;
+        chunk_key_center(key, &cx, &cz);
+        rec = chunk_cache_insert(&state->chunk_cache, &key, cx, cz);
+        if (rec != NULL) {
+            rec->last_used_frame = state->frame_count;
+            chunk_queue_push_if_absent(&state->chunk_cache, &key);
+        }
+    }
+
+    if (chunk_queue_size(&state->chunk_cache) == 0u) {
+        return;
+    }
+
+    SDL_GPUCommandBuffer *command_buffer = SDL_AcquireGPUCommandBuffer(state->device);
+    for (uint32_t n = 0u; n < CHUNK_MAX_GEN_PER_FRAME; n += 1u) {
+        ChunkGenKey key;
+        if (!chunk_queue_pop(&state->chunk_cache, &key)) {
+            break;
+        }
+        ChunkRecord *rec = chunk_cache_find(&state->chunk_cache, &key);
+        if (rec == NULL || rec->status != CHUNK_STATUS_QUEUED) {
+            continue; /* evicted or already handled before generation ran */
+        }
+        rec->status = CHUNK_STATUS_GENERATING;
+        if (generate_chunk(state, command_buffer, rec)) {
+            rec->status = CHUNK_STATUS_READY;
+            state->dbg_generated += 1u;
+        } else {
+            rec->status = CHUNK_STATUS_FAILED;
+            state->dbg_failed += 1u;
+        }
+    }
+    SDL_SubmitGPUCommandBuffer(command_buffer);
+}
+
+static void
+chunk_system_render(AppState *state, SDL_GPURenderPass *render_pass) {
+    state->dbg_rendered = 0u;
+    for (size_t i = 0u; i < state->active_count; i += 1u) {
+        ChunkRecord *rec = chunk_cache_find(&state->chunk_cache, &state->active_keys[i]);
+        if (rec != NULL && rec->status == CHUNK_STATUS_READY) {
+            terrain_gpu_render(render_pass, &state->chunk_pool[rec->slot]);
+            state->dbg_rendered += 1u;
+        }
+    }
 }
 
 static void
@@ -762,11 +898,12 @@ SDL_AppInit(void **appstate, int argc, char *argv[]) {
     if (smoke_frames != NULL) {
         state->smoke_frame_limit = (uint32_t)SDL_atoi(smoke_frames);
     }
-    state->camera_position[0] = 16.0f;
-    state->camera_position[1] = 30.0f;
-    state->camera_position[2] = -28.0f;
+    /* Spawn near the center of the finite region, looking across the terrain. */
+    state->camera_position[0] = chunk_region_extent() * 0.5f;
+    state->camera_position[1] = 44.0f;
+    state->camera_position[2] = chunk_region_extent() * 0.5f - 40.0f;
     state->camera_yaw = 0.0f;
-    state->camera_pitch = -0.35f;
+    state->camera_pitch = -0.38f;
     state->camera_fov_degrees = 60.0f;
     state->fps = 0.0f;
     state->last_frame_ticks = SDL_GetPerformanceCounter();
@@ -820,6 +957,7 @@ SDL_AppIterate(void *appstate) {
     const float instant_fps = dt > 0.000001f ? 1.0f / dt : 0.0f;
     state->fps = state->fps <= 0.0f ? instant_fps : state->fps * 0.92f + instant_fps * 0.08f;
     update_camera(state, dt);
+    chunk_system_update(state);
 
     SDL_GPUCommandBuffer *command_buffer = SDL_AcquireGPUCommandBuffer(state->device);
 
@@ -866,7 +1004,7 @@ SDL_AppIterate(void *appstate) {
 
     SDL_GPURenderPass *render_pass = SDL_BeginGPURenderPass(command_buffer, &color_target_info, 1u, &depth_info);
     SDL_BindGPUGraphicsPipeline(render_pass, state->graphics_pipeline);
-    terrain_gpu_render(render_pass, &state->terrain);
+    chunk_system_render(state, render_pass);
 
     HudUniform hud = {
         .viewport = {(float)width, (float)height, 0.0f, 0.0f},
@@ -960,27 +1098,16 @@ SDL_AppEvent(void *appstate, SDL_Event *event) {
                     needs_regen = true;
                 }
                 break;
-            case SDLK_MINUS:
-            case SDLK_KP_MINUS:
-                if (state->terrain_detail > TERRAIN_MIN_DETAIL) {
-                    state->terrain_detail /= 2u;
-                    needs_regen = true;
-                }
-                break;
-            case SDLK_EQUALS:
-            case SDLK_PLUS:
-            case SDLK_KP_PLUS:
-                if (state->terrain_detail < TERRAIN_MAX_DETAIL) {
-                    state->terrain_detail *= 2u;
-                    needs_regen = true;
-                }
-                break;
             default:
                 break;
         }
 
-        if (needs_regen && !regenerate_terrain(state)) {
-            return SDL_APP_FAILURE;
+        if (needs_regen) {
+            /* Density parameters changed: refresh derived height fields and bump
+             * the density version. New generation keys cause active chunks to
+             * regenerate gradually while stale ones age out via eviction. */
+            terrain_region_apply_height_range(&state->terrain_config);
+            state->density_version += 1u;
         }
     }
 
@@ -998,7 +1125,11 @@ SDL_AppQuit(void *appstate, SDL_AppResult result) {
     log_info("Shutting down...");
 
     if (state->device != NULL) {
-        terrain_gpu_destroy(state->device, &state->terrain);
+        if (state->chunk_pool != NULL) {
+            for (uint32_t i = 0u; i < CHUNK_POOL_CAPACITY; i += 1u) {
+                terrain_gpu_destroy(state->device, &state->chunk_pool[i]);
+            }
+        }
         if (state->depth_texture != NULL) {
             SDL_ReleaseGPUTexture(state->device, state->depth_texture);
         }
@@ -1016,7 +1147,8 @@ SDL_AppQuit(void *appstate, SDL_AppResult result) {
         }
         SDL_DestroyGPUDevice(state->device);
     }
-    sparse_grid_destroy(&state->sparse_grid);
+    chunk_cache_destroy(&state->chunk_cache);
+    free(state->chunk_pool);
     if (state->window != NULL) {
         SDL_DestroyWindow(state->window);
     }
