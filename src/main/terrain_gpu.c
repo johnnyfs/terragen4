@@ -113,7 +113,9 @@ make_params(const TerrainGpuPipeline *pipeline) {
             layout->origin_x,
             layout->origin_y,
             layout->origin_z,
-            0.0f,
+            /* Skirt depth scales with cell size so it spans the vertical mismatch
+             * at a one-LOD transition (the coarser neighbour's cells are 2x). */
+            layout->cell_size * 4.0f,
         },
         .lmin = {layout->local_min_x, layout->local_min_z, 0, 0},
         .omin = {layout->owned_min_x, layout->owned_min_y, layout->owned_min_z, 0},
