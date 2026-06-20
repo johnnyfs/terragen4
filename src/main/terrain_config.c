@@ -46,7 +46,7 @@ terrain_region_snap_height_bounds(const TerrainRegionConfig *config) {
     };
 }
 
-static uint32_t
+uint32_t
 terrain_hash_u32(uint32_t x) {
     x ^= x >> 16u;
     x *= 0x7feb352du;

@@ -50,7 +50,7 @@ add_custom_command(
 enable_testing()
 
 add_executable(terrain_cpu_tests
-    ${sources_test}
+    src/test/terrain_cpu_tests.c
     src/main/sparse_grid.c
     src/main/terrain_config.c
     src/main/terrain_cpu_reference.c
@@ -59,3 +59,13 @@ target_compile_options(terrain_cpu_tests PUBLIC -std=c23 -Wall -Wfloat-conversio
 target_include_directories(terrain_cpu_tests PUBLIC src/main)
 target_link_libraries(terrain_cpu_tests m)
 add_test(NAME terrain_cpu_tests COMMAND terrain_cpu_tests)
+
+add_executable(chunk_coord_tests
+    src/test/chunk_coord_tests.c
+    src/main/chunk_coord.c
+    src/main/terrain_config.c
+)
+target_compile_options(chunk_coord_tests PUBLIC -std=c23 -Wall -Wfloat-conversion)
+target_include_directories(chunk_coord_tests PUBLIC src/main)
+target_link_libraries(chunk_coord_tests m)
+add_test(NAME chunk_coord_tests COMMAND chunk_coord_tests)

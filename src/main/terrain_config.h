@@ -25,6 +25,7 @@ typedef struct TerrainHeightBounds {
     int32_t max_y;
 } TerrainHeightBounds;
 
+uint32_t terrain_hash_u32(uint32_t x);
 TerrainRegionConfig terrain_default_region_config(void);
 void terrain_region_apply_height_range(TerrainRegionConfig *config);
 TerrainHeightBounds terrain_region_snap_height_bounds(const TerrainRegionConfig *config);
