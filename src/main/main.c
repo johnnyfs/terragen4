@@ -577,6 +577,18 @@ build_and_upload_hud(AppState *state, SDL_GPUCommandBuffer *command_buffer) {
 
     SDL_snprintf(line, sizeof(line), "ZOOM %.1f DEG", state->camera_fov_degrees);
     hud_emit_text(vertices, &count, x, y, scale, line);
+    y += line_step;
+
+    SDL_snprintf(line, sizeof(line), "WARP %.1f", state->terrain_config.warp_amount);
+    hud_emit_text(vertices, &count, x, y, scale, line);
+    y += line_step;
+
+    SDL_snprintf(line, sizeof(line), "FREQ %.3f", state->terrain_config.noise_frequency);
+    hud_emit_text(vertices, &count, x, y, scale, line);
+    y += line_step;
+
+    SDL_snprintf(line, sizeof(line), "OCTAVES %u", state->terrain_config.noise_octaves);
+    hud_emit_text(vertices, &count, x, y, scale, line);
 
     SDL_UnmapGPUTransferBuffer(state->device, state->hud_transfer_buffer);
     state->hud_vertex_count = count;
@@ -937,6 +949,34 @@ SDL_AppEvent(void *appstate, SDL_Event *event) {
                     48.0f
                 );
                 needs_regen = true;
+                break;
+            case SDLK_U:
+                state->terrain_config.warp_amount = clampf(state->terrain_config.warp_amount - 1.0f, 0.0f, 24.0f);
+                needs_regen = true;
+                break;
+            case SDLK_I:
+                state->terrain_config.warp_amount = clampf(state->terrain_config.warp_amount + 1.0f, 0.0f, 24.0f);
+                needs_regen = true;
+                break;
+            case SDLK_N:
+                state->terrain_config.noise_frequency = clampf(state->terrain_config.noise_frequency * 0.85f, 0.02f, 0.22f);
+                needs_regen = true;
+                break;
+            case SDLK_M:
+                state->terrain_config.noise_frequency = clampf(state->terrain_config.noise_frequency * 1.18f, 0.02f, 0.22f);
+                needs_regen = true;
+                break;
+            case SDLK_LEFTBRACKET:
+                if (state->terrain_config.noise_octaves > 1u) {
+                    state->terrain_config.noise_octaves -= 1u;
+                    needs_regen = true;
+                }
+                break;
+            case SDLK_RIGHTBRACKET:
+                if (state->terrain_config.noise_octaves < 6u) {
+                    state->terrain_config.noise_octaves += 1u;
+                    needs_regen = true;
+                }
                 break;
             case SDLK_MINUS:
             case SDLK_KP_MINUS:

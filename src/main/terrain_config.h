@@ -13,6 +13,11 @@ typedef struct TerrainRegionConfig {
     float noise_frequency;
     float noise_amplitude;
     float base_height;
+    float warp_amount;
+    float warp_frequency;
+    float noise_lacunarity;
+    float noise_gain;
+    uint32_t noise_octaves;
 } TerrainRegionConfig;
 
 typedef struct TerrainHeightBounds {
@@ -24,5 +29,6 @@ TerrainRegionConfig terrain_default_region_config(void);
 void terrain_region_apply_height_range(TerrainRegionConfig *config);
 TerrainHeightBounds terrain_region_snap_height_bounds(const TerrainRegionConfig *config);
 float terrain_height_sample(const TerrainRegionConfig *config, float x, float z);
+float terrain_density_sample(const TerrainRegionConfig *config, float x, float y, float z);
 
 #endif

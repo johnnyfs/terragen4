@@ -6,6 +6,7 @@ layout(std140, set = 2, binding = 0) uniform TerrainParams {
     uvec4 counts;
     ivec4 bounds;
     vec4 noise;
+    vec4 field;
 } params;
 
 layout(std430, set = 0, binding = 0) readonly buffer GridCoords {
@@ -31,33 +32,68 @@ uint hash_u32(uint x) {
     return x;
 }
 
-float value_noise(uint seed, int x, int z) {
+float value_noise(uint seed, int x, int y, int z) {
     uint h = seed;
     h ^= hash_u32(uint(x) + 0x9e3779b9u);
+    h ^= hash_u32(uint(y) + 0xc2b2ae35u);
     h ^= hash_u32(uint(z) + 0x85ebca6bu);
     h = hash_u32(h);
     return (float(h & 0x00ffffffu) / float(0x00ffffffu)) * 2.0 - 1.0;
 }
 
-float terrain_height(float x, float z) {
+float noise3(vec3 p, uint seed_offset) {
+    ivec3 p0 = ivec3(floor(p));
+    vec3 f = smoothstep(vec3(0.0), vec3(1.0), fract(p));
+    uint seed = uint(params.bounds.z) + seed_offset;
+
+    float c000 = value_noise(seed, p0.x, p0.y, p0.z);
+    float c100 = value_noise(seed, p0.x + 1, p0.y, p0.z);
+    float c010 = value_noise(seed, p0.x, p0.y + 1, p0.z);
+    float c110 = value_noise(seed, p0.x + 1, p0.y + 1, p0.z);
+    float c001 = value_noise(seed, p0.x, p0.y, p0.z + 1);
+    float c101 = value_noise(seed, p0.x + 1, p0.y, p0.z + 1);
+    float c011 = value_noise(seed, p0.x, p0.y + 1, p0.z + 1);
+    float c111 = value_noise(seed, p0.x + 1, p0.y + 1, p0.z + 1);
+
+    float x00 = mix(c000, c100, f.x);
+    float x10 = mix(c010, c110, f.x);
+    float x01 = mix(c001, c101, f.x);
+    float x11 = mix(c011, c111, f.x);
+    float y0 = mix(x00, x10, f.y);
+    float y1 = mix(x01, x11, f.y);
+    return mix(y0, y1, f.z);
+}
+
+float fbm3(vec3 p) {
+    float sum = 0.0;
+    float amplitude = 1.0;
     float frequency = params.noise.y;
-    float amplitude = params.noise.z;
-    float base_height = params.noise.w;
-    uint seed = uint(params.bounds.z);
-    vec2 p = vec2(x, z) * frequency;
-    ivec2 p0 = ivec2(floor(p));
-    vec2 f = smoothstep(vec2(0.0), vec2(1.0), fract(p));
-    float h00 = value_noise(seed, p0.x, p0.y);
-    float h10 = value_noise(seed, p0.x + 1, p0.y);
-    float h01 = value_noise(seed, p0.x, p0.y + 1);
-    float h11 = value_noise(seed, p0.x + 1, p0.y + 1);
-    float hx0 = mix(h00, h10, f.x);
-    float hx1 = mix(h01, h11, f.x);
-    return base_height + mix(hx0, hx1, f.y) * amplitude;
+    float normalizer = 0.0;
+    int octaves = clamp(params.bounds.w, 1, 6);
+
+    for (int i = 0; i < octaves; i += 1) {
+        sum += noise3(p * frequency, uint(i) * 101u) * amplitude;
+        normalizer += amplitude;
+        frequency *= params.field.z;
+        amplitude *= params.field.w;
+    }
+    return normalizer > 0.0 ? sum / normalizer : 0.0;
 }
 
 float sample_sdf(vec3 p) {
-    return p.y - terrain_height(p.x, p.z);
+    vec3 warp = vec3(
+        noise3(p * params.field.y, 311u),
+        noise3(p * params.field.y, 719u),
+        noise3(p * params.field.y, 1201u)
+    ) * params.field.x;
+    vec3 q = p + warp;
+
+    float broad = noise3(vec3(q.x * params.noise.y * 0.38, 0.0, q.z * params.noise.y * 0.38), 0u);
+    float detail = fbm3(q);
+    float ridge = (1.0 - abs(fbm3(q * vec3(1.0, 0.7, 1.0) + vec3(53.0, 0.0, -29.0)))) * 2.0 - 1.0;
+    float displacement = params.noise.z * (broad * 0.55 + detail * 0.30 + ridge * 0.15);
+
+    return p.y - params.noise.w - displacement;
 }
 
 vec3 corner_position(ivec3 coord, uint corner) {

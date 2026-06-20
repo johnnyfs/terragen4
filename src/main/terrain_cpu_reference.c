@@ -23,17 +23,18 @@ corner_position(const TerrainRegionConfig *config, int32_t x, int32_t y, int32_t
 
 static float
 sample_sdf(const TerrainRegionConfig *config, const float p[3]) {
-    return p[1] - terrain_height_sample(config, p[0], p[2]);
+    return terrain_density_sample(config, p[0], p[1], p[2]);
 }
 
 static void
-sample_normal(const TerrainRegionConfig *config, float x, float z, float out[3]) {
+sample_normal(const TerrainRegionConfig *config, const float p[3], float out[3]) {
     const float e = config->grid_resolution > 0.0f ? config->grid_resolution : 1.0f;
-    const float dhdx = (terrain_height_sample(config, x + e, z) - terrain_height_sample(config, x - e, z)) / (2.0f * e);
-    const float dhdz = (terrain_height_sample(config, x, z + e) - terrain_height_sample(config, x, z - e)) / (2.0f * e);
-    const float nx = -dhdx;
-    const float ny = 1.0f;
-    const float nz = -dhdz;
+    const float nx = terrain_density_sample(config, p[0] + e, p[1], p[2]) -
+        terrain_density_sample(config, p[0] - e, p[1], p[2]);
+    const float ny = terrain_density_sample(config, p[0], p[1] + e, p[2]) -
+        terrain_density_sample(config, p[0], p[1] - e, p[2]);
+    const float nz = terrain_density_sample(config, p[0], p[1], p[2] + e) -
+        terrain_density_sample(config, p[0], p[1], p[2] - e);
     const float len = sqrtf(nx * nx + ny * ny + nz * nz);
 
     out[0] = nx / len;
@@ -67,7 +68,9 @@ terrain_cpu_hermite_cell(const TerrainRegionConfig *config, int32_t cell_x, int3
             const float pz = corners[a][2] + (corners[b][2] - corners[a][2]) * t;
             float n[3] = {0};
 
-            sample_normal(config, px, pz, n);
+            const float p[3] = {px, py, pz};
+
+            sample_normal(config, p, n);
             cell.position[0] += px;
             cell.position[1] += py;
             cell.position[2] += pz;

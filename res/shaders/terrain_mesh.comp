@@ -6,7 +6,14 @@ layout(std140, set = 2, binding = 0) uniform TerrainParams {
     uvec4 counts;
     ivec4 bounds;
     vec4 noise;
+    vec4 field;
 } params;
+
+struct CellSamples {
+    ivec4 coord;
+    vec4 s0;
+    vec4 s1;
+};
 
 struct HermiteCell {
     ivec4 coord_active;
@@ -31,6 +38,10 @@ layout(std430, set = 0, binding = 0) readonly buffer HermiteBuffer {
     HermiteCell hermite[];
 } hermite_buffer;
 
+layout(std430, set = 0, binding = 1) readonly buffer SampleBuffer {
+    CellSamples samples[];
+} sample_buffer;
+
 layout(std430, set = 1, binding = 0) buffer VertexBuffer {
     MeshVertex vertices[];
 } vertex_buffer;
@@ -39,77 +50,126 @@ layout(std430, set = 1, binding = 1) buffer DrawBuffer {
     DrawArgs draw_args;
 } draw_buffer;
 
-uint hash_u32(uint x) {
-    x ^= x >> 16u;
-    x *= 0x7feb352du;
-    x ^= x >> 15u;
-    x *= 0x846ca68bu;
-    x ^= x >> 16u;
-    return x;
+float sample_at(CellSamples cell, uint index) {
+    return index < 4u ? cell.s0[index] : cell.s1[index - 4u];
 }
 
-float value_noise(uint seed, int x, int z) {
-    uint h = seed;
-    h ^= hash_u32(uint(x) + 0x9e3779b9u);
-    h ^= hash_u32(uint(z) + 0x85ebca6bu);
-    h = hash_u32(h);
-    return (float(h & 0x00ffffffu) / float(0x00ffffffu)) * 2.0 - 1.0;
-}
-
-float terrain_height(float x, float z) {
-    float frequency = params.noise.y;
-    float amplitude = params.noise.z;
-    float base_height = params.noise.w;
-    uint seed = uint(params.bounds.z);
-    vec2 p = vec2(x, z) * frequency;
-    ivec2 p0 = ivec2(floor(p));
-    vec2 f = smoothstep(vec2(0.0), vec2(1.0), fract(p));
-    float h00 = value_noise(seed, p0.x, p0.y);
-    float h10 = value_noise(seed, p0.x + 1, p0.y);
-    float h01 = value_noise(seed, p0.x, p0.y + 1);
-    float h11 = value_noise(seed, p0.x + 1, p0.y + 1);
-    float hx0 = mix(h00, h10, f.x);
-    float hx1 = mix(h01, h11, f.x);
-    return base_height + mix(hx0, hx1, f.y) * amplitude;
-}
-
-vec3 terrain_normal(float x, float z) {
-    float e = max(params.noise.x, 0.001);
-    float dhdx = (terrain_height(x + e, z) - terrain_height(x - e, z)) / (2.0 * e);
-    float dhdz = (terrain_height(x, z + e) - terrain_height(x, z - e)) / (2.0 * e);
-    return normalize(vec3(-dhdx, 1.0, -dhdz));
+int cell_index(int x, int y, int z) {
+    int height_count = params.bounds.y - params.bounds.x;
+    if (x < 0 || x >= int(params.counts.y) || z < 0 || z >= int(params.counts.z)) {
+        return -1;
+    }
+    if (y < params.bounds.x || y >= params.bounds.y || height_count <= 0) {
+        return -1;
+    }
+    return z * height_count * int(params.counts.y) + (y - params.bounds.x) * int(params.counts.y) + x;
 }
 
 vec4 terrain_color(float y, vec3 normal) {
-    vec3 low = vec3(0.18, 0.43, 0.24);
-    vec3 high = vec3(0.58, 0.56, 0.48);
+    vec3 grass = vec3(0.18, 0.40, 0.23);
+    vec3 earth = vec3(0.42, 0.34, 0.24);
+    vec3 rock = vec3(0.58, 0.56, 0.50);
     float elevation = clamp((y - params.noise.w + params.noise.z) / max(params.noise.z * 2.0, 0.001), 0.0, 1.0);
     float slope = 1.0 - clamp(normal.y, 0.0, 1.0);
-    vec3 color = mix(low, high, elevation * 0.65 + slope * 0.35);
+    vec3 base = mix(grass, earth, elevation);
+    vec3 color = mix(base, rock, clamp(slope * 1.4, 0.0, 1.0));
     return vec4(color, 1.0);
 }
 
-vec3 centered_position(float x, float y, float z) {
-    return vec3(
-        x - float(params.counts.y) * params.noise.x * 0.5,
-        y,
-        z - float(params.counts.z) * params.noise.x * 0.5
-    );
-}
-
-MeshVertex make_vertex(float x, float z) {
-    float y = terrain_height(x, z);
-    vec3 n = terrain_normal(x, z);
+MeshVertex make_vertex(HermiteCell cell) {
+    vec3 p = cell.position.xyz;
+    vec3 n = normalize(cell.normal_crossings.xyz);
     MeshVertex v;
-    v.position = vec4(centered_position(x, y, z), 1.0);
+    v.position = vec4(
+        p.x - float(params.counts.y) * params.noise.x * 0.5,
+        p.y,
+        p.z - float(params.counts.z) * params.noise.x * 0.5,
+        1.0
+    );
     v.normal = vec4(n, 0.0);
-    v.color = terrain_color(y, n);
+    v.color = terrain_color(p.y, n);
     return v;
 }
 
-void emit_vertex(uint index, MeshVertex vertex) {
-    if (index < params.counts.w) {
-        vertex_buffer.vertices[index] = vertex;
+bool load_cell(int x, int y, int z, out HermiteCell cell) {
+    int index = cell_index(x, y, z);
+    if (index < 0) {
+        return false;
+    }
+    cell = hermite_buffer.hermite[index];
+    return cell.coord_active.w != 0;
+}
+
+void emit_quad(HermiteCell c0, HermiteCell c1, HermiteCell c2, HermiteCell c3, bool flip) {
+    uint base = atomicAdd(draw_buffer.draw_args.num_vertices, 6u);
+    if (base + 6u > params.counts.w) {
+        return;
+    }
+
+    MeshVertex v0 = make_vertex(c0);
+    MeshVertex v1 = make_vertex(c1);
+    MeshVertex v2 = make_vertex(c2);
+    MeshVertex v3 = make_vertex(c3);
+
+    if (!flip) {
+        vertex_buffer.vertices[base + 0u] = v0;
+        vertex_buffer.vertices[base + 1u] = v1;
+        vertex_buffer.vertices[base + 2u] = v2;
+        vertex_buffer.vertices[base + 3u] = v0;
+        vertex_buffer.vertices[base + 4u] = v2;
+        vertex_buffer.vertices[base + 5u] = v3;
+    } else {
+        vertex_buffer.vertices[base + 0u] = v0;
+        vertex_buffer.vertices[base + 1u] = v2;
+        vertex_buffer.vertices[base + 2u] = v1;
+        vertex_buffer.vertices[base + 3u] = v0;
+        vertex_buffer.vertices[base + 4u] = v3;
+        vertex_buffer.vertices[base + 5u] = v2;
+    }
+}
+
+void emit_x_edge(ivec3 c, bool flip) {
+    HermiteCell c0;
+    HermiteCell c1;
+    HermiteCell c2;
+    HermiteCell c3;
+    if (
+        load_cell(c.x, c.y, c.z, c0) &&
+        load_cell(c.x, c.y - 1, c.z, c1) &&
+        load_cell(c.x, c.y - 1, c.z - 1, c2) &&
+        load_cell(c.x, c.y, c.z - 1, c3)
+    ) {
+        emit_quad(c0, c1, c2, c3, flip);
+    }
+}
+
+void emit_y_edge(ivec3 c, bool flip) {
+    HermiteCell c0;
+    HermiteCell c1;
+    HermiteCell c2;
+    HermiteCell c3;
+    if (
+        load_cell(c.x, c.y, c.z, c0) &&
+        load_cell(c.x, c.y, c.z - 1, c1) &&
+        load_cell(c.x - 1, c.y, c.z - 1, c2) &&
+        load_cell(c.x - 1, c.y, c.z, c3)
+    ) {
+        emit_quad(c0, c1, c2, c3, flip);
+    }
+}
+
+void emit_z_edge(ivec3 c, bool flip) {
+    HermiteCell c0;
+    HermiteCell c1;
+    HermiteCell c2;
+    HermiteCell c3;
+    if (
+        load_cell(c.x, c.y, c.z, c0) &&
+        load_cell(c.x - 1, c.y, c.z, c1) &&
+        load_cell(c.x - 1, c.y - 1, c.z, c2) &&
+        load_cell(c.x, c.y - 1, c.z, c3)
+    ) {
+        emit_quad(c0, c1, c2, c3, flip);
     }
 }
 
@@ -126,24 +186,22 @@ void main() {
     barrier();
 
     for (uint i = local_index; i < params.counts.x; i += gl_WorkGroupSize.x) {
-        HermiteCell cell = hermite_buffer.hermite[i];
-        if (cell.coord_active.w == 0) {
-            continue;
+        CellSamples sample_cell = sample_buffer.samples[i];
+        ivec3 c = sample_cell.coord.xyz;
+
+        float s0 = sample_at(sample_cell, 0u);
+        float sx = sample_at(sample_cell, 1u);
+        float sy = sample_at(sample_cell, 4u);
+        float sz = sample_at(sample_cell, 2u);
+
+        if ((s0 < 0.0 && sx >= 0.0) || (s0 >= 0.0 && sx < 0.0)) {
+            emit_x_edge(c, s0 < sx);
         }
-
-        ivec3 coord = cell.coord_active.xyz;
-        float r = params.noise.x;
-        MeshVertex v00 = make_vertex(float(coord.x) * r, float(coord.z) * r);
-        MeshVertex v10 = make_vertex(float(coord.x + 1) * r, float(coord.z) * r);
-        MeshVertex v01 = make_vertex(float(coord.x) * r, float(coord.z + 1) * r);
-        MeshVertex v11 = make_vertex(float(coord.x + 1) * r, float(coord.z + 1) * r);
-
-        uint base = atomicAdd(draw_buffer.draw_args.num_vertices, 6u);
-        emit_vertex(base + 0u, v00);
-        emit_vertex(base + 1u, v01);
-        emit_vertex(base + 2u, v10);
-        emit_vertex(base + 3u, v10);
-        emit_vertex(base + 4u, v01);
-        emit_vertex(base + 5u, v11);
+        if ((s0 < 0.0 && sy >= 0.0) || (s0 >= 0.0 && sy < 0.0)) {
+            emit_y_edge(c, s0 < sy);
+        }
+        if ((s0 < 0.0 && sz >= 0.0) || (s0 >= 0.0 && sz < 0.0)) {
+            emit_z_edge(c, s0 < sz);
+        }
     }
 }

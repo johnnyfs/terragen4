@@ -8,6 +8,7 @@ typedef struct TerrainGpuParams {
     uint32_t counts[4];
     int32_t bounds[4];
     float noise[4];
+    float field[4];
 } TerrainGpuParams;
 
 typedef struct CellSamplesGpu {
@@ -89,13 +90,19 @@ make_params(const TerrainGpuPipeline *pipeline) {
             terrain_region_snap_height_bounds(&pipeline->config).min_y,
             terrain_region_snap_height_bounds(&pipeline->config).max_y,
             (int32_t)pipeline->config.seed,
-            0,
+            (int32_t)pipeline->config.noise_octaves,
         },
         .noise = {
             pipeline->config.grid_resolution,
             pipeline->config.noise_frequency,
             pipeline->config.noise_amplitude,
             pipeline->config.base_height,
+        },
+        .field = {
+            pipeline->config.warp_amount,
+            pipeline->config.warp_frequency,
+            pipeline->config.noise_lacunarity,
+            pipeline->config.noise_gain,
         },
     };
 }
@@ -146,7 +153,7 @@ terrain_gpu_init(SDL_GPUDevice *device, const TerrainRegionConfig *config, const
     *pipeline = (TerrainGpuPipeline) {0};
     pipeline->config = *config;
     pipeline->cell_count = (uint32_t)grid->count;
-    pipeline->max_vertices = config->size_x * config->size_z * 6u;
+    pipeline->max_vertices = pipeline->cell_count * 6u;
 
     pipeline->sample_pipeline = create_compute_pipeline(
         device,
@@ -163,7 +170,7 @@ terrain_gpu_init(SDL_GPUDevice *device, const TerrainRegionConfig *config, const
     pipeline->mesh_pipeline = create_compute_pipeline(
         device,
         "res/shaders/compiled/terrain_mesh.comp.spv",
-        1u,
+        2u,
         2u
     );
     if (pipeline->sample_pipeline == NULL || pipeline->hermite_pipeline == NULL || pipeline->mesh_pipeline == NULL) {
@@ -259,8 +266,8 @@ dispatch_mesh_stage(SDL_GPUCommandBuffer *command_buffer, TerrainGpuPipeline *pi
     };
     SDL_GPUComputePass *pass = SDL_BeginGPUComputePass(command_buffer, NULL, 0u, writes, 2u);
     SDL_BindGPUComputePipeline(pass, pipeline->mesh_pipeline);
-    SDL_GPUBuffer *reads[1] = {pipeline->hermite_buffer};
-    SDL_BindGPUComputeStorageBuffers(pass, 0u, reads, 1u);
+    SDL_GPUBuffer *reads[2] = {pipeline->hermite_buffer, pipeline->sample_buffer};
+    SDL_BindGPUComputeStorageBuffers(pass, 0u, reads, 2u);
     SDL_PushGPUComputeUniformData(command_buffer, 0u, params, sizeof(*params));
     SDL_DispatchGPUCompute(pass, 1u, 1u, 1u);
     SDL_EndGPUComputePass(pass);
