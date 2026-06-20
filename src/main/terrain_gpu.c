@@ -1,0 +1,321 @@
+#include "terrain_gpu.h"
+
+#include <stddef.h>
+
+#include "log.h"
+
+typedef struct TerrainGpuParams {
+    uint32_t counts[4];
+    int32_t bounds[4];
+    float noise[4];
+} TerrainGpuParams;
+
+typedef struct CellSamplesGpu {
+    int32_t coord[4];
+    float s0[4];
+    float s1[4];
+} CellSamplesGpu;
+
+typedef struct HermiteCellGpu {
+    int32_t coord_active[4];
+    float position[4];
+    float normal_crossings[4];
+} HermiteCellGpu;
+
+static SDL_GPUComputePipeline *
+create_compute_pipeline(SDL_GPUDevice *device, const char *path, uint32_t readonly_buffers, uint32_t readwrite_buffers) {
+    size_t code_size = 0u;
+    void *code = SDL_LoadFile(path, &code_size);
+    if (code == NULL) {
+        const char *base_path = SDL_GetBasePath();
+        char *full_path = NULL;
+        if (base_path != NULL && SDL_asprintf(&full_path, "%s%s", base_path, path) >= 0) {
+            code = SDL_LoadFile(full_path, &code_size);
+            SDL_free(full_path);
+        }
+        if (code == NULL) {
+            log_error("Could not load compute shader %s: %s", path, SDL_GetError());
+            return NULL;
+        }
+    }
+
+    SDL_GPUComputePipelineCreateInfo info = {
+        .code_size = code_size,
+        .code = code,
+        .entrypoint = "main",
+        .format = SDL_GPU_SHADERFORMAT_SPIRV,
+        .num_readonly_storage_buffers = readonly_buffers,
+        .num_readwrite_storage_buffers = readwrite_buffers,
+        .num_uniform_buffers = 1,
+        .threadcount_x = 64u,
+        .threadcount_y = 1u,
+        .threadcount_z = 1u,
+    };
+
+    SDL_GPUComputePipeline *pipeline = SDL_CreateGPUComputePipeline(device, &info);
+    if (pipeline == NULL) {
+        log_error("Could not create compute pipeline from %s: %s", path, SDL_GetError());
+    }
+
+    SDL_free(code);
+    return pipeline;
+}
+
+static SDL_GPUBuffer *
+create_buffer(SDL_GPUDevice *device, SDL_GPUBufferUsageFlags usage, uint32_t size, const char *name) {
+    SDL_GPUBufferCreateInfo info = {
+        .usage = usage,
+        .size = size == 0u ? 4u : size,
+    };
+    SDL_GPUBuffer *buffer = SDL_CreateGPUBuffer(device, &info);
+    if (buffer == NULL) {
+        log_error("Could not create %s buffer: %s", name, SDL_GetError());
+    } else {
+        SDL_SetGPUBufferName(device, buffer, name);
+    }
+    return buffer;
+}
+
+static TerrainGpuParams
+make_params(const TerrainGpuPipeline *pipeline) {
+    return (TerrainGpuParams) {
+        .counts = {
+            pipeline->cell_count,
+            pipeline->config.size_x,
+            pipeline->config.size_z,
+            pipeline->max_vertices,
+        },
+        .bounds = {
+            terrain_region_snap_height_bounds(&pipeline->config).min_y,
+            terrain_region_snap_height_bounds(&pipeline->config).max_y,
+            (int32_t)pipeline->config.seed,
+            0,
+        },
+        .noise = {
+            pipeline->config.grid_resolution,
+            pipeline->config.noise_frequency,
+            pipeline->config.noise_amplitude,
+            pipeline->config.base_height,
+        },
+    };
+}
+
+static bool
+upload_grid_coords(SDL_GPUDevice *device, const SparseGrid *grid, TerrainGpuPipeline *pipeline) {
+    const uint32_t upload_size = (uint32_t)(grid->count * sizeof(SparseGridCoord));
+    SDL_GPUTransferBufferCreateInfo transfer_info = {
+        .usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
+        .size = upload_size == 0u ? 4u : upload_size,
+    };
+    pipeline->coord_transfer = SDL_CreateGPUTransferBuffer(device, &transfer_info);
+    if (pipeline->coord_transfer == NULL) {
+        log_error("Could not create terrain coordinate upload buffer: %s", SDL_GetError());
+        return false;
+    }
+
+    if (upload_size > 0u) {
+        void *data = SDL_MapGPUTransferBuffer(device, pipeline->coord_transfer, false);
+        if (data == NULL) {
+            log_error("Could not map terrain coordinate upload buffer: %s", SDL_GetError());
+            return false;
+        }
+        SDL_memcpy(data, grid->coords, upload_size);
+        SDL_UnmapGPUTransferBuffer(device, pipeline->coord_transfer);
+
+        SDL_GPUCommandBuffer *command_buffer = SDL_AcquireGPUCommandBuffer(device);
+        SDL_GPUCopyPass *copy_pass = SDL_BeginGPUCopyPass(command_buffer);
+        SDL_GPUTransferBufferLocation location = {
+            .transfer_buffer = pipeline->coord_transfer,
+            .offset = 0u,
+        };
+        SDL_GPUBufferRegion region = {
+            .buffer = pipeline->coord_buffer,
+            .offset = 0u,
+            .size = upload_size,
+        };
+        SDL_UploadToGPUBuffer(copy_pass, &location, &region, false);
+        SDL_EndGPUCopyPass(copy_pass);
+        SDL_SubmitGPUCommandBuffer(command_buffer);
+    }
+
+    return true;
+}
+
+bool
+terrain_gpu_init(SDL_GPUDevice *device, const TerrainRegionConfig *config, const SparseGrid *grid, TerrainGpuPipeline *pipeline) {
+    *pipeline = (TerrainGpuPipeline) {0};
+    pipeline->config = *config;
+    pipeline->cell_count = (uint32_t)grid->count;
+    pipeline->max_vertices = config->size_x * config->size_z * 6u;
+
+    pipeline->sample_pipeline = create_compute_pipeline(
+        device,
+        "res/shaders/compiled/terrain_sample.comp.spv",
+        1u,
+        1u
+    );
+    pipeline->hermite_pipeline = create_compute_pipeline(
+        device,
+        "res/shaders/compiled/terrain_hermite.comp.spv",
+        1u,
+        1u
+    );
+    pipeline->mesh_pipeline = create_compute_pipeline(
+        device,
+        "res/shaders/compiled/terrain_mesh.comp.spv",
+        1u,
+        2u
+    );
+    if (pipeline->sample_pipeline == NULL || pipeline->hermite_pipeline == NULL || pipeline->mesh_pipeline == NULL) {
+        return false;
+    }
+
+    pipeline->coord_buffer = create_buffer(
+        device,
+        SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_READ,
+        (uint32_t)(grid->count * sizeof(SparseGridCoord)),
+        "terrain coords"
+    );
+    pipeline->sample_buffer = create_buffer(
+        device,
+        SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_READ | SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_WRITE,
+        pipeline->cell_count * (uint32_t)sizeof(CellSamplesGpu),
+        "terrain samples"
+    );
+    pipeline->hermite_buffer = create_buffer(
+        device,
+        SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_READ | SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_WRITE,
+        pipeline->cell_count * (uint32_t)sizeof(HermiteCellGpu),
+        "terrain hermite"
+    );
+    pipeline->vertex_buffer = create_buffer(
+        device,
+        SDL_GPU_BUFFERUSAGE_VERTEX | SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_WRITE,
+        pipeline->max_vertices * (uint32_t)sizeof(TerrainMeshVertex),
+        "terrain vertices"
+    );
+    pipeline->indirect_buffer = create_buffer(
+        device,
+        SDL_GPU_BUFFERUSAGE_INDIRECT | SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_WRITE,
+        (uint32_t)sizeof(SDL_GPUIndirectDrawCommand),
+        "terrain indirect draw"
+    );
+
+    if (
+        pipeline->coord_buffer == NULL ||
+        pipeline->sample_buffer == NULL ||
+        pipeline->hermite_buffer == NULL ||
+        pipeline->vertex_buffer == NULL ||
+        pipeline->indirect_buffer == NULL
+    ) {
+        return false;
+    }
+
+    if (!upload_grid_coords(device, grid, pipeline)) {
+        return false;
+    }
+
+    log_info(
+        "Terrain GPU resources: %u cells, %u max vertices",
+        pipeline->cell_count,
+        pipeline->max_vertices
+    );
+    return true;
+}
+
+static void
+dispatch_sample_stage(SDL_GPUCommandBuffer *command_buffer, TerrainGpuPipeline *pipeline, const TerrainGpuParams *params) {
+    SDL_GPUStorageBufferReadWriteBinding writes[1] = {
+        {.buffer = pipeline->sample_buffer, .cycle = false},
+    };
+    SDL_GPUComputePass *pass = SDL_BeginGPUComputePass(command_buffer, NULL, 0u, writes, 1u);
+    SDL_BindGPUComputePipeline(pass, pipeline->sample_pipeline);
+    SDL_GPUBuffer *reads[1] = {pipeline->coord_buffer};
+    SDL_BindGPUComputeStorageBuffers(pass, 0u, reads, 1u);
+    SDL_PushGPUComputeUniformData(command_buffer, 0u, params, sizeof(*params));
+    SDL_DispatchGPUCompute(pass, (pipeline->cell_count + 63u) / 64u, 1u, 1u);
+    SDL_EndGPUComputePass(pass);
+}
+
+static void
+dispatch_hermite_stage(SDL_GPUCommandBuffer *command_buffer, TerrainGpuPipeline *pipeline, const TerrainGpuParams *params) {
+    SDL_GPUStorageBufferReadWriteBinding writes[1] = {
+        {.buffer = pipeline->hermite_buffer, .cycle = false},
+    };
+    SDL_GPUComputePass *pass = SDL_BeginGPUComputePass(command_buffer, NULL, 0u, writes, 1u);
+    SDL_BindGPUComputePipeline(pass, pipeline->hermite_pipeline);
+    SDL_GPUBuffer *reads[1] = {pipeline->sample_buffer};
+    SDL_BindGPUComputeStorageBuffers(pass, 0u, reads, 1u);
+    SDL_PushGPUComputeUniformData(command_buffer, 0u, params, sizeof(*params));
+    SDL_DispatchGPUCompute(pass, (pipeline->cell_count + 63u) / 64u, 1u, 1u);
+    SDL_EndGPUComputePass(pass);
+}
+
+static void
+dispatch_mesh_stage(SDL_GPUCommandBuffer *command_buffer, TerrainGpuPipeline *pipeline, const TerrainGpuParams *params) {
+    SDL_GPUStorageBufferReadWriteBinding writes[2] = {
+        {.buffer = pipeline->vertex_buffer, .cycle = false},
+        {.buffer = pipeline->indirect_buffer, .cycle = false},
+    };
+    SDL_GPUComputePass *pass = SDL_BeginGPUComputePass(command_buffer, NULL, 0u, writes, 2u);
+    SDL_BindGPUComputePipeline(pass, pipeline->mesh_pipeline);
+    SDL_GPUBuffer *reads[1] = {pipeline->hermite_buffer};
+    SDL_BindGPUComputeStorageBuffers(pass, 0u, reads, 1u);
+    SDL_PushGPUComputeUniformData(command_buffer, 0u, params, sizeof(*params));
+    SDL_DispatchGPUCompute(pass, 1u, 1u, 1u);
+    SDL_EndGPUComputePass(pass);
+}
+
+void
+terrain_gpu_generate(SDL_GPUCommandBuffer *command_buffer, TerrainGpuPipeline *pipeline) {
+    if (pipeline->cell_count == 0u || pipeline->max_vertices == 0u) {
+        return;
+    }
+
+    TerrainGpuParams params = make_params(pipeline);
+    dispatch_sample_stage(command_buffer, pipeline, &params);
+    dispatch_hermite_stage(command_buffer, pipeline, &params);
+    dispatch_mesh_stage(command_buffer, pipeline, &params);
+}
+
+void
+terrain_gpu_render(SDL_GPURenderPass *render_pass, TerrainGpuPipeline *pipeline) {
+    SDL_GPUBufferBinding binding = {
+        .buffer = pipeline->vertex_buffer,
+        .offset = 0u,
+    };
+    SDL_BindGPUVertexBuffers(render_pass, 0u, &binding, 1u);
+    SDL_DrawGPUPrimitivesIndirect(render_pass, pipeline->indirect_buffer, 0u, 1u);
+}
+
+void
+terrain_gpu_destroy(SDL_GPUDevice *device, TerrainGpuPipeline *pipeline) {
+    if (pipeline->coord_transfer != NULL) {
+        SDL_ReleaseGPUTransferBuffer(device, pipeline->coord_transfer);
+    }
+    if (pipeline->indirect_buffer != NULL) {
+        SDL_ReleaseGPUBuffer(device, pipeline->indirect_buffer);
+    }
+    if (pipeline->vertex_buffer != NULL) {
+        SDL_ReleaseGPUBuffer(device, pipeline->vertex_buffer);
+    }
+    if (pipeline->hermite_buffer != NULL) {
+        SDL_ReleaseGPUBuffer(device, pipeline->hermite_buffer);
+    }
+    if (pipeline->sample_buffer != NULL) {
+        SDL_ReleaseGPUBuffer(device, pipeline->sample_buffer);
+    }
+    if (pipeline->coord_buffer != NULL) {
+        SDL_ReleaseGPUBuffer(device, pipeline->coord_buffer);
+    }
+    if (pipeline->mesh_pipeline != NULL) {
+        SDL_ReleaseGPUComputePipeline(device, pipeline->mesh_pipeline);
+    }
+    if (pipeline->hermite_pipeline != NULL) {
+        SDL_ReleaseGPUComputePipeline(device, pipeline->hermite_pipeline);
+    }
+    if (pipeline->sample_pipeline != NULL) {
+        SDL_ReleaseGPUComputePipeline(device, pipeline->sample_pipeline);
+    }
+    *pipeline = (TerrainGpuPipeline) {0};
+}

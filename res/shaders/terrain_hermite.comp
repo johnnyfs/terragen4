@@ -1,0 +1,138 @@
+#version 460
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std140, set = 2, binding = 0) uniform TerrainParams {
+    uvec4 counts;
+    ivec4 bounds;
+    vec4 noise;
+} params;
+
+struct CellSamples {
+    ivec4 coord;
+    vec4 s0;
+    vec4 s1;
+};
+
+struct HermiteCell {
+    ivec4 coord_active;
+    vec4 position;
+    vec4 normal_crossings;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer SampleBuffer {
+    CellSamples samples[];
+} sample_buffer;
+
+layout(std430, set = 1, binding = 0) buffer HermiteBuffer {
+    HermiteCell hermite[];
+} hermite_buffer;
+
+const uvec2 edges[12] = uvec2[12](
+    uvec2(0u, 1u), uvec2(1u, 3u), uvec2(3u, 2u), uvec2(2u, 0u),
+    uvec2(4u, 5u), uvec2(5u, 7u), uvec2(7u, 6u), uvec2(6u, 4u),
+    uvec2(0u, 4u), uvec2(1u, 5u), uvec2(2u, 6u), uvec2(3u, 7u)
+);
+
+uint hash_u32(uint x) {
+    x ^= x >> 16u;
+    x *= 0x7feb352du;
+    x ^= x >> 15u;
+    x *= 0x846ca68bu;
+    x ^= x >> 16u;
+    return x;
+}
+
+float value_noise(uint seed, int x, int z) {
+    uint h = seed;
+    h ^= hash_u32(uint(x) + 0x9e3779b9u);
+    h ^= hash_u32(uint(z) + 0x85ebca6bu);
+    h = hash_u32(h);
+    return (float(h & 0x00ffffffu) / float(0x00ffffffu)) * 2.0 - 1.0;
+}
+
+float terrain_height(float x, float z) {
+    float frequency = params.noise.y;
+    float amplitude = params.noise.z;
+    float base_height = params.noise.w;
+    uint seed = uint(params.bounds.z);
+    vec2 p = vec2(x, z) * frequency;
+    ivec2 p0 = ivec2(floor(p));
+    vec2 f = smoothstep(vec2(0.0), vec2(1.0), fract(p));
+    float h00 = value_noise(seed, p0.x, p0.y);
+    float h10 = value_noise(seed, p0.x + 1, p0.y);
+    float h01 = value_noise(seed, p0.x, p0.y + 1);
+    float h11 = value_noise(seed, p0.x + 1, p0.y + 1);
+    float hx0 = mix(h00, h10, f.x);
+    float hx1 = mix(h01, h11, f.x);
+    return base_height + mix(hx0, hx1, f.y) * amplitude;
+}
+
+vec3 terrain_normal(float x, float z) {
+    float e = max(params.noise.x, 0.001);
+    float dhdx = (terrain_height(x + e, z) - terrain_height(x - e, z)) / (2.0 * e);
+    float dhdz = (terrain_height(x, z + e) - terrain_height(x, z - e)) / (2.0 * e);
+    return normalize(vec3(-dhdx, 1.0, -dhdz));
+}
+
+float sample_at(CellSamples cell, uint index) {
+    return index < 4u ? cell.s0[index] : cell.s1[index - 4u];
+}
+
+vec3 corner_position(ivec3 coord, uint corner) {
+    float r = params.noise.x;
+    return vec3(
+        float(coord.x) + float(corner & 1u),
+        float(coord.y) + float((corner >> 2u) & 1u),
+        float(coord.z) + float((corner >> 1u) & 1u)
+    ) * r;
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= params.counts.x) {
+        return;
+    }
+
+    CellSamples cell = sample_buffer.samples[index];
+    ivec3 coord = cell.coord.xyz;
+    vec3 position_sum = vec3(0.0);
+    vec3 normal_sum = vec3(0.0);
+    uint crossings = 0u;
+
+    for (uint i = 0u; i < 12u; i += 1u) {
+        uint a = edges[i].x;
+        uint b = edges[i].y;
+        float va = sample_at(cell, a);
+        float vb = sample_at(cell, b);
+        if ((va < 0.0 && vb >= 0.0) || (va >= 0.0 && vb < 0.0)) {
+            float denom = va - vb;
+            float t = abs(denom) > 0.000001 ? va / denom : 0.5;
+            vec3 pa = corner_position(coord, a);
+            vec3 pb = corner_position(coord, b);
+            vec3 p = mix(pa, pb, clamp(t, 0.0, 1.0));
+            position_sum += p;
+            normal_sum += terrain_normal(p.x, p.z);
+            crossings += 1u;
+        }
+    }
+
+    float r = params.noise.x;
+    float h00 = terrain_height(float(coord.x) * r, float(coord.z) * r);
+    float h10 = terrain_height(float(coord.x + 1) * r, float(coord.z) * r);
+    float h01 = terrain_height(float(coord.x) * r, float(coord.z + 1) * r);
+    float h11 = terrain_height(float(coord.x + 1) * r, float(coord.z + 1) * r);
+    int surface_y = int(floor(((h00 + h10 + h01 + h11) * 0.25) / params.noise.x));
+    bool is_active = crossings > 0u && coord.y == surface_y;
+
+    HermiteCell out_cell;
+    out_cell.coord_active = ivec4(coord, is_active ? 1 : 0);
+    if (is_active) {
+        out_cell.position = vec4(position_sum / float(crossings), 1.0);
+        out_cell.normal_crossings = vec4(normalize(normal_sum), float(crossings));
+    } else {
+        out_cell.position = vec4(0.0);
+        out_cell.normal_crossings = vec4(0.0);
+    }
+    hermite_buffer.hermite[index] = out_cell;
+}

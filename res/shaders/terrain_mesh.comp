@@ -1,0 +1,149 @@
+#version 460
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std140, set = 2, binding = 0) uniform TerrainParams {
+    uvec4 counts;
+    ivec4 bounds;
+    vec4 noise;
+} params;
+
+struct HermiteCell {
+    ivec4 coord_active;
+    vec4 position;
+    vec4 normal_crossings;
+};
+
+struct MeshVertex {
+    vec4 position;
+    vec4 normal;
+    vec4 color;
+};
+
+struct DrawArgs {
+    uint num_vertices;
+    uint num_instances;
+    uint first_vertex;
+    uint first_instance;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer HermiteBuffer {
+    HermiteCell hermite[];
+} hermite_buffer;
+
+layout(std430, set = 1, binding = 0) buffer VertexBuffer {
+    MeshVertex vertices[];
+} vertex_buffer;
+
+layout(std430, set = 1, binding = 1) buffer DrawBuffer {
+    DrawArgs draw_args;
+} draw_buffer;
+
+uint hash_u32(uint x) {
+    x ^= x >> 16u;
+    x *= 0x7feb352du;
+    x ^= x >> 15u;
+    x *= 0x846ca68bu;
+    x ^= x >> 16u;
+    return x;
+}
+
+float value_noise(uint seed, int x, int z) {
+    uint h = seed;
+    h ^= hash_u32(uint(x) + 0x9e3779b9u);
+    h ^= hash_u32(uint(z) + 0x85ebca6bu);
+    h = hash_u32(h);
+    return (float(h & 0x00ffffffu) / float(0x00ffffffu)) * 2.0 - 1.0;
+}
+
+float terrain_height(float x, float z) {
+    float frequency = params.noise.y;
+    float amplitude = params.noise.z;
+    float base_height = params.noise.w;
+    uint seed = uint(params.bounds.z);
+    vec2 p = vec2(x, z) * frequency;
+    ivec2 p0 = ivec2(floor(p));
+    vec2 f = smoothstep(vec2(0.0), vec2(1.0), fract(p));
+    float h00 = value_noise(seed, p0.x, p0.y);
+    float h10 = value_noise(seed, p0.x + 1, p0.y);
+    float h01 = value_noise(seed, p0.x, p0.y + 1);
+    float h11 = value_noise(seed, p0.x + 1, p0.y + 1);
+    float hx0 = mix(h00, h10, f.x);
+    float hx1 = mix(h01, h11, f.x);
+    return base_height + mix(hx0, hx1, f.y) * amplitude;
+}
+
+vec3 terrain_normal(float x, float z) {
+    float e = max(params.noise.x, 0.001);
+    float dhdx = (terrain_height(x + e, z) - terrain_height(x - e, z)) / (2.0 * e);
+    float dhdz = (terrain_height(x, z + e) - terrain_height(x, z - e)) / (2.0 * e);
+    return normalize(vec3(-dhdx, 1.0, -dhdz));
+}
+
+vec4 terrain_color(float y, vec3 normal) {
+    vec3 low = vec3(0.18, 0.43, 0.24);
+    vec3 high = vec3(0.58, 0.56, 0.48);
+    float elevation = clamp((y - params.noise.w + params.noise.z) / max(params.noise.z * 2.0, 0.001), 0.0, 1.0);
+    float slope = 1.0 - clamp(normal.y, 0.0, 1.0);
+    vec3 color = mix(low, high, elevation * 0.65 + slope * 0.35);
+    return vec4(color, 1.0);
+}
+
+vec3 centered_position(float x, float y, float z) {
+    return vec3(
+        x - float(params.counts.y) * params.noise.x * 0.5,
+        y,
+        z - float(params.counts.z) * params.noise.x * 0.5
+    );
+}
+
+MeshVertex make_vertex(float x, float z) {
+    float y = terrain_height(x, z);
+    vec3 n = terrain_normal(x, z);
+    MeshVertex v;
+    v.position = vec4(centered_position(x, y, z), 1.0);
+    v.normal = vec4(n, 0.0);
+    v.color = terrain_color(y, n);
+    return v;
+}
+
+void emit_vertex(uint index, MeshVertex vertex) {
+    if (index < params.counts.w) {
+        vertex_buffer.vertices[index] = vertex;
+    }
+}
+
+void main() {
+    uint local_index = gl_LocalInvocationID.x;
+    if (local_index == 0u) {
+        draw_buffer.draw_args.num_vertices = 0u;
+        draw_buffer.draw_args.num_instances = 1u;
+        draw_buffer.draw_args.first_vertex = 0u;
+        draw_buffer.draw_args.first_instance = 0u;
+    }
+
+    memoryBarrierBuffer();
+    barrier();
+
+    for (uint i = local_index; i < params.counts.x; i += gl_WorkGroupSize.x) {
+        HermiteCell cell = hermite_buffer.hermite[i];
+        if (cell.coord_active.w == 0) {
+            continue;
+        }
+
+        ivec3 coord = cell.coord_active.xyz;
+        float r = params.noise.x;
+        MeshVertex v00 = make_vertex(float(coord.x) * r, float(coord.z) * r);
+        MeshVertex v10 = make_vertex(float(coord.x + 1) * r, float(coord.z) * r);
+        MeshVertex v01 = make_vertex(float(coord.x) * r, float(coord.z + 1) * r);
+        MeshVertex v11 = make_vertex(float(coord.x + 1) * r, float(coord.z + 1) * r);
+
+        uint base = atomicAdd(draw_buffer.draw_args.num_vertices, 6u);
+        emit_vertex(base + 0u, v00);
+        emit_vertex(base + 1u, v01);
+        emit_vertex(base + 2u, v10);
+        emit_vertex(base + 3u, v10);
+        emit_vertex(base + 4u, v01);
+        emit_vertex(base + 5u, v11);
+    }
+}

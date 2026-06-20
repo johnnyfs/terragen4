@@ -1,0 +1,95 @@
+#version 460
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std140, set = 2, binding = 0) uniform TerrainParams {
+    uvec4 counts;
+    ivec4 bounds;
+    vec4 noise;
+} params;
+
+layout(std430, set = 0, binding = 0) readonly buffer GridCoords {
+    ivec4 coords[];
+} grid_coords;
+
+struct CellSamples {
+    ivec4 coord;
+    vec4 s0;
+    vec4 s1;
+};
+
+layout(std430, set = 1, binding = 0) buffer SampleBuffer {
+    CellSamples samples[];
+} sample_buffer;
+
+uint hash_u32(uint x) {
+    x ^= x >> 16u;
+    x *= 0x7feb352du;
+    x ^= x >> 15u;
+    x *= 0x846ca68bu;
+    x ^= x >> 16u;
+    return x;
+}
+
+float value_noise(uint seed, int x, int z) {
+    uint h = seed;
+    h ^= hash_u32(uint(x) + 0x9e3779b9u);
+    h ^= hash_u32(uint(z) + 0x85ebca6bu);
+    h = hash_u32(h);
+    return (float(h & 0x00ffffffu) / float(0x00ffffffu)) * 2.0 - 1.0;
+}
+
+float terrain_height(float x, float z) {
+    float frequency = params.noise.y;
+    float amplitude = params.noise.z;
+    float base_height = params.noise.w;
+    uint seed = uint(params.bounds.z);
+    vec2 p = vec2(x, z) * frequency;
+    ivec2 p0 = ivec2(floor(p));
+    vec2 f = smoothstep(vec2(0.0), vec2(1.0), fract(p));
+    float h00 = value_noise(seed, p0.x, p0.y);
+    float h10 = value_noise(seed, p0.x + 1, p0.y);
+    float h01 = value_noise(seed, p0.x, p0.y + 1);
+    float h11 = value_noise(seed, p0.x + 1, p0.y + 1);
+    float hx0 = mix(h00, h10, f.x);
+    float hx1 = mix(h01, h11, f.x);
+    return base_height + mix(hx0, hx1, f.y) * amplitude;
+}
+
+float sample_sdf(vec3 p) {
+    return p.y - terrain_height(p.x, p.z);
+}
+
+vec3 corner_position(ivec3 coord, uint corner) {
+    float r = params.noise.x;
+    return vec3(
+        float(coord.x) + float(corner & 1u),
+        float(coord.y) + float((corner >> 2u) & 1u),
+        float(coord.z) + float((corner >> 1u) & 1u)
+    ) * r;
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= params.counts.x) {
+        return;
+    }
+
+    ivec4 coord4 = grid_coords.coords[index];
+    ivec3 coord = coord4.xyz;
+    CellSamples cell;
+    cell.coord = coord4;
+    cell.s0 = vec4(
+        sample_sdf(corner_position(coord, 0u)),
+        sample_sdf(corner_position(coord, 1u)),
+        sample_sdf(corner_position(coord, 2u)),
+        sample_sdf(corner_position(coord, 3u))
+    );
+    cell.s1 = vec4(
+        sample_sdf(corner_position(coord, 4u)),
+        sample_sdf(corner_position(coord, 5u)),
+        sample_sdf(corner_position(coord, 6u)),
+        sample_sdf(corner_position(coord, 7u))
+    );
+    sample_buffer.samples[index] = cell;
+}
