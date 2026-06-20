@@ -144,6 +144,96 @@ chunk_genkey_hash(const ChunkGenKey *key) {
     return terrain_hash_u32(h);
 }
 
+float
+chunk_refine_threshold(uint32_t lod) {
+    /* Threshold spacing tracks the 2x chunk-size growth between LODs, which
+     * keeps edge-adjacent visible chunks within one LOD of each other. */
+    return chunk_world_size(lod) * 1.5f;
+}
+
+typedef struct ActiveSetCtx {
+    float pov_x;
+    float pov_z;
+    uint32_t region_id;
+    uint32_t density_version;
+    uint32_t mesh_version;
+    uint32_t material_version;
+    ChunkGenKey *out_keys;
+    size_t out_capacity;
+    size_t count;
+} ActiveSetCtx;
+
+static void
+active_set_emit_or_refine(ActiveSetCtx *ctx, ChunkCoord c) {
+    if (!chunk_in_region(c)) {
+        return;
+    }
+    if (c.lod > 0u && chunk_distance_to_bounds(c, ctx->pov_x, ctx->pov_z) < chunk_refine_threshold(c.lod)) {
+        const uint32_t child_lod = c.lod - 1u;
+        for (int32_t dz = 0; dz < 2; dz += 1) {
+            for (int32_t dx = 0; dx < 2; dx += 1) {
+                const ChunkCoord child = {
+                    .cx = c.cx * 2 + dx,
+                    .cz = c.cz * 2 + dz,
+                    .lod = child_lod,
+                };
+                active_set_emit_or_refine(ctx, child);
+            }
+        }
+        return;
+    }
+    if (ctx->out_keys != NULL && ctx->count < ctx->out_capacity) {
+        ctx->out_keys[ctx->count] = (ChunkGenKey) {
+            .region_id = ctx->region_id,
+            .cx = c.cx,
+            .cz = c.cz,
+            .lod = c.lod,
+            .density_version = ctx->density_version,
+            .mesh_version = ctx->mesh_version,
+            .material_version = ctx->material_version,
+        };
+    }
+    ctx->count += 1u;
+}
+
+size_t
+chunk_active_set(
+    float pov_x,
+    float pov_z,
+    uint32_t region_id,
+    uint32_t density_version,
+    uint32_t mesh_version,
+    uint32_t material_version,
+    ChunkGenKey *out_keys,
+    size_t out_capacity
+) {
+    ActiveSetCtx ctx = {
+        .pov_x = pov_x,
+        .pov_z = pov_z,
+        .region_id = region_id,
+        .density_version = density_version,
+        .mesh_version = mesh_version,
+        .material_version = material_version,
+        .out_keys = out_keys,
+        .out_capacity = out_capacity,
+        .count = 0u,
+    };
+
+    const uint32_t coarse = CHUNK_LOD_COUNT - 1u;
+    const ChunkCoord center = chunk_from_world(coarse, pov_x, pov_z);
+    for (int32_t dz = -CHUNK_CLIP_COARSE_RADIUS; dz <= CHUNK_CLIP_COARSE_RADIUS; dz += 1) {
+        for (int32_t dx = -CHUNK_CLIP_COARSE_RADIUS; dx <= CHUNK_CLIP_COARSE_RADIUS; dx += 1) {
+            const ChunkCoord seed = {
+                .cx = center.cx + dx,
+                .cz = center.cz + dz,
+                .lod = coarse,
+            };
+            active_set_emit_or_refine(&ctx, seed);
+        }
+    }
+    return ctx.count;
+}
+
 size_t
 chunk_active_set_single_lod(
     float pov_x,

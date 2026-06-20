@@ -32,8 +32,7 @@ typedef struct HudVertex {
 
 /* Chunk system runtime budget (tunable). Resident memory ~= pool capacity x
  * per-chunk buffers, so the pool caps how many chunks stay live at once. */
-#define CHUNK_POOL_CAPACITY 160u
-#define CHUNK_ACTIVE_RADIUS 4
+#define CHUNK_POOL_CAPACITY 256u
 #define CHUNK_MAX_GEN_PER_FRAME 6u
 #define CHUNK_MAX_ACTIVE 4096u
 
@@ -755,8 +754,8 @@ chunk_system_update(AppState *state) {
     const float pov_x = state->camera_position[0];
     const float pov_z = state->camera_position[2];
 
-    state->active_count = chunk_active_set_single_lod(
-        pov_x, pov_z, 0u, CHUNK_ACTIVE_RADIUS, CHUNK_REGION_TEST,
+    state->active_count = chunk_active_set(
+        pov_x, pov_z, CHUNK_REGION_TEST,
         state->density_version, 1u, 1u, state->active_keys, CHUNK_MAX_ACTIVE
     );
 

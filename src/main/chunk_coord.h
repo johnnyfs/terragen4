@@ -34,6 +34,9 @@
 /* Reserved region identity; the future region graph adds more. */
 #define CHUNK_REGION_TEST 0u
 
+/* Coarse seed radius (in coarsest-LOD chunks) around the POV for the clipmap. */
+#define CHUNK_CLIP_COARSE_RADIUS 2
+
 typedef struct ChunkCoord {
     int32_t cx;
     int32_t cz;
@@ -105,6 +108,27 @@ uint32_t chunk_genkey_hash(const ChunkGenKey *key);
  * out_capacity keys and returns the number of active chunks. The multi-LOD
  * clipmap-ring selection is layered on top of this in a later phase.
  */
+/* Distance below which a LOD-`lod` chunk is refined into its finer children. */
+float chunk_refine_threshold(uint32_t lod);
+
+/*
+ * Multi-LOD active set via a restricted quadtree clipmap: coarse chunks near the
+ * POV are recursively refined into finer children, so coverage is gap-free,
+ * each world point is owned by exactly one LOD, and edge-adjacent visible chunks
+ * differ by at most one LOD. Out-of-region children are dropped. Writes up to
+ * out_capacity keys and returns the number of active chunks.
+ */
+size_t chunk_active_set(
+    float pov_x,
+    float pov_z,
+    uint32_t region_id,
+    uint32_t density_version,
+    uint32_t mesh_version,
+    uint32_t material_version,
+    ChunkGenKey *out_keys,
+    size_t out_capacity
+);
+
 size_t chunk_active_set_single_lod(
     float pov_x,
     float pov_z,
