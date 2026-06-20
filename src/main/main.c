@@ -31,8 +31,9 @@ typedef struct HudVertex {
 #define HUD_MAX_VERTICES 49152u
 
 /* Chunk system runtime budget (tunable). Resident memory ~= pool capacity x
- * per-chunk buffers, so the pool caps how many chunks stay live at once. */
-#define CHUNK_POOL_CAPACITY 256u
+ * per-chunk buffers, so the pool caps how many chunks stay live at once. The
+ * default can be overridden at runtime via TERRAGEN_POOL. */
+#define CHUNK_POOL_CAPACITY_DEFAULT 256u
 #define CHUNK_MAX_GEN_PER_FRAME 6u
 #define CHUNK_MAX_ACTIVE 4096u
 
@@ -53,6 +54,7 @@ typedef struct AppState {
     /* Chunk system: a pool of GPU pipelines indexed by cache record slots. */
     ChunkCache chunk_cache;
     TerrainGpuPipeline *chunk_pool;
+    uint32_t pool_capacity;
     uint32_t density_version;
     ChunkGenKey active_keys[CHUNK_MAX_ACTIVE];
     size_t active_count;
@@ -67,10 +69,13 @@ typedef struct AppState {
     uint32_t dbg_failed;
     uint32_t dbg_resident;
     uint32_t dbg_queue;
+    uint32_t dbg_evictions_total;
+    uint32_t dbg_generated_total;
     uint32_t dbg_lod[CHUNK_LOD_COUNT];
 
     uint32_t frame_count;
     uint32_t smoke_frame_limit;
+    float smoke_drift;
     uint64_t last_frame_ticks;
     float fps;
     float last_regen_ms;
@@ -579,7 +584,7 @@ build_and_upload_hud(AppState *state, SDL_GPUCommandBuffer *command_buffer) {
         state->dbg_active,
         state->dbg_rendered,
         state->dbg_resident,
-        (unsigned)CHUNK_POOL_CAPACITY
+        (unsigned)state->pool_capacity
     );
     hud_emit_text(vertices, &count, x, y, scale, line);
     y += line_step;
@@ -708,12 +713,21 @@ initialize_terrain(AppState *state) {
     state->terrain_config = terrain_default_region_config();
     state->density_version = 1u;
 
-    state->chunk_pool = calloc(CHUNK_POOL_CAPACITY, sizeof(*state->chunk_pool));
+    state->pool_capacity = CHUNK_POOL_CAPACITY_DEFAULT;
+    const char *pool_env = getenv("TERRAGEN_POOL");
+    if (pool_env != NULL) {
+        const int requested = SDL_atoi(pool_env);
+        if (requested > 0) {
+            state->pool_capacity = (uint32_t)requested;
+        }
+    }
+
+    state->chunk_pool = calloc(state->pool_capacity, sizeof(*state->chunk_pool));
     if (state->chunk_pool == NULL) {
         log_error("Could not allocate chunk pipeline pool");
         return false;
     }
-    if (!chunk_cache_init(&state->chunk_cache, CHUNK_POOL_CAPACITY)) {
+    if (!chunk_cache_init(&state->chunk_cache, state->pool_capacity)) {
         log_error("Could not initialise chunk cache");
         return false;
     }
@@ -723,7 +737,7 @@ initialize_terrain(AppState *state) {
         (int)chunk_count_per_axis(0u),
         (int)chunk_count_per_axis(0u),
         (unsigned)CHUNK_CELLS,
-        (unsigned)CHUNK_POOL_CAPACITY
+        (unsigned)state->pool_capacity
     );
     return true;
 }
@@ -818,6 +832,7 @@ chunk_system_update(AppState *state) {
                  * the slot's buffers can be reused by the next same-LOD chunk. */
                 chunk_cache_remove(&state->chunk_cache, &victim->key);
                 state->dbg_evictions += 1u;
+                state->dbg_evictions_total += 1u;
             }
         }
 
@@ -846,6 +861,7 @@ chunk_system_update(AppState *state) {
             if (generate_chunk(state, command_buffer, rec)) {
                 rec->status = CHUNK_STATUS_READY;
                 state->dbg_generated += 1u;
+                state->dbg_generated_total += 1u;
             } else {
                 rec->status = CHUNK_STATUS_FAILED;
                 state->dbg_failed += 1u;
@@ -861,13 +877,14 @@ chunk_system_update(AppState *state) {
     if ((state->frame_count % 120u) == 0u) {
         log_info(
             "chunks active=%u rendered=%u L0/L1/L2=%u/%u/%u resident=%u/%u queue=%u "
-            "hit=%u miss=%u evict=%u gen=%u fail=%u",
+            "hit=%u miss=%u evict=%u gen=%u fail=%u | totals gen=%u evict=%u",
             state->dbg_active, state->dbg_rendered,
             state->dbg_lod[0], CHUNK_LOD_COUNT > 1u ? state->dbg_lod[1] : 0u,
             CHUNK_LOD_COUNT > 2u ? state->dbg_lod[2] : 0u,
-            state->dbg_resident, (unsigned)CHUNK_POOL_CAPACITY, state->dbg_queue,
+            state->dbg_resident, (unsigned)state->pool_capacity, state->dbg_queue,
             state->dbg_hits, state->dbg_misses, state->dbg_evictions,
-            state->dbg_generated, state->dbg_failed
+            state->dbg_generated, state->dbg_failed,
+            state->dbg_generated_total, state->dbg_evictions_total
         );
     }
 }
@@ -927,6 +944,12 @@ update_camera(AppState *state, float dt) {
         state->camera_position[0] += move[0] / len * speed * dt;
         state->camera_position[2] += move[2] / len * speed * dt;
     }
+
+    /* Headless verification: drift the POV so smoke runs exercise chunk
+     * load/unload/eviction without interactive input. */
+    if (state->smoke_drift != 0.0f) {
+        state->camera_position[0] += state->smoke_drift * dt;
+    }
 }
 
 SDL_AppResult
@@ -943,6 +966,10 @@ SDL_AppInit(void **appstate, int argc, char *argv[]) {
     const char *smoke_frames = getenv("TERRAGEN_SMOKE_FRAMES");
     if (smoke_frames != NULL) {
         state->smoke_frame_limit = (uint32_t)SDL_atoi(smoke_frames);
+    }
+    const char *smoke_drift = getenv("TERRAGEN_SMOKE_DRIFT");
+    if (smoke_drift != NULL) {
+        state->smoke_drift = (float)SDL_atof(smoke_drift);
     }
     /* Spawn near the center of the finite region, looking across the terrain. */
     state->camera_position[0] = chunk_region_extent() * 0.5f;
@@ -1172,7 +1199,7 @@ SDL_AppQuit(void *appstate, SDL_AppResult result) {
 
     if (state->device != NULL) {
         if (state->chunk_pool != NULL) {
-            for (uint32_t i = 0u; i < CHUNK_POOL_CAPACITY; i += 1u) {
+            for (uint32_t i = 0u; i < state->pool_capacity; i += 1u) {
                 terrain_gpu_destroy(state->device, &state->chunk_pool[i]);
             }
         }

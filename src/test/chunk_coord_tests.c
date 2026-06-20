@@ -252,6 +252,19 @@ test_active_set_core_is_finest_and_stable(void) {
     }
 }
 
+static void
+test_active_set_multilod_in_region(void) {
+    /* Even at a region corner, no active chunk falls outside the finite region. */
+    ChunkGenKey keys[4096];
+    const float edge = chunk_world_size(0u) * 0.5f;
+    const size_t n = chunk_active_set(edge, edge, CHUNK_REGION_TEST, 1u, 1u, 1u, keys, 4096u);
+    assert(n > 0u);
+    for (size_t i = 0u; i < n; i += 1u) {
+        const ChunkCoord c = {.cx = keys[i].cx, .cz = keys[i].cz, .lod = keys[i].lod};
+        assert(chunk_in_region(c));
+    }
+}
+
 int
 main(void) {
     test_world_chunk_roundtrip();
@@ -264,5 +277,6 @@ main(void) {
     test_active_set_no_gaps();
     test_active_set_neighbor_lod_within_one();
     test_active_set_core_is_finest_and_stable();
+    test_active_set_multilod_in_region();
     return 0;
 }
