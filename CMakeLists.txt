@@ -52,6 +52,7 @@ enable_testing()
 add_executable(terrain_cpu_tests
     src/test/terrain_cpu_tests.c
     src/main/sparse_grid.c
+    src/main/chunk_coord.c
     src/main/terrain_config.c
     src/main/terrain_cpu_reference.c
 )

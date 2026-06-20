@@ -17,6 +17,7 @@ typedef struct TerrainMeshVertex {
 
 typedef struct TerrainGpuPipeline {
     TerrainRegionConfig config;
+    ChunkLayout layout;
     uint32_t cell_count;
     uint32_t max_vertices;
 
@@ -36,6 +37,7 @@ bool terrain_gpu_init(
     SDL_GPUDevice *device,
     const TerrainRegionConfig *config,
     const SparseGrid *grid,
+    const ChunkLayout *layout,
     TerrainGpuPipeline *pipeline
 );
 void terrain_gpu_generate(SDL_GPUCommandBuffer *command_buffer, TerrainGpuPipeline *pipeline);

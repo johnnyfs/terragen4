@@ -3,10 +3,14 @@
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(std140, set = 2, binding = 0) uniform TerrainParams {
-    uvec4 counts;
-    ivec4 bounds;
-    vec4 noise;
-    vec4 field;
+    uvec4 counts;  // cell_count, array_dim_x, array_dim_z, max_vertices
+    ivec4 bounds;  // local_min_y, array_dim_y, seed, octaves
+    vec4 noise;    // cell_size, noise_freq, noise_amp, base_height
+    vec4 field;    // warp_amount, warp_freq, lacunarity, gain
+    vec4 chunk;    // origin_x, origin_y, origin_z, skirt_depth
+    ivec4 lmin;    // local_min_x, local_min_z, _, _
+    ivec4 omin;    // owned_min_x, owned_min_y, owned_min_z, _
+    ivec4 odim;    // owned_dim_x, owned_dim_y, owned_dim_z, _
 } params;
 
 struct CellSamples {
@@ -55,14 +59,31 @@ float sample_at(CellSamples cell, uint index) {
 }
 
 int cell_index(int x, int y, int z) {
-    int height_count = params.bounds.y - params.bounds.x;
-    if (x < 0 || x >= int(params.counts.y) || z < 0 || z >= int(params.counts.z)) {
+    int ax = int(params.counts.y);
+    int ay = params.bounds.y;
+    int az = int(params.counts.z);
+    int lmx = params.lmin.x;
+    int lmy = params.bounds.x;
+    int lmz = params.lmin.y;
+    if (ax <= 0 || ay <= 0 || az <= 0) {
         return -1;
     }
-    if (y < params.bounds.x || y >= params.bounds.y || height_count <= 0) {
+    if (x < lmx || x >= lmx + ax) {
         return -1;
     }
-    return z * height_count * int(params.counts.y) + (y - params.bounds.x) * int(params.counts.y) + x;
+    if (y < lmy || y >= lmy + ay) {
+        return -1;
+    }
+    if (z < lmz || z >= lmz + az) {
+        return -1;
+    }
+    return (z - lmz) * ay * ax + (y - lmy) * ax + (x - lmx);
+}
+
+bool cell_is_owned(ivec3 c) {
+    return c.x >= params.omin.x && c.x < params.omin.x + params.odim.x &&
+           c.y >= params.omin.y && c.y < params.omin.y + params.odim.y &&
+           c.z >= params.omin.z && c.z < params.omin.z + params.odim.z;
 }
 
 vec4 terrain_color(float y, vec3 normal) {
@@ -80,12 +101,9 @@ MeshVertex make_vertex(HermiteCell cell) {
     vec3 p = cell.position.xyz;
     vec3 n = normalize(cell.normal_crossings.xyz);
     MeshVertex v;
-    v.position = vec4(
-        p.x - float(params.counts.y) * params.noise.x * 0.5,
-        p.y,
-        p.z - float(params.counts.z) * params.noise.x * 0.5,
-        1.0
-    );
+    /* Hermite positions are already absolute world coordinates (corner_position
+     * adds the chunk origin), so no centering offset is applied here. */
+    v.position = vec4(p.x, p.y, p.z, 1.0);
     v.normal = vec4(n, 0.0);
     v.color = terrain_color(p.y, n);
     return v;
@@ -188,6 +206,12 @@ void main() {
     for (uint i = local_index; i < params.counts.x; i += gl_WorkGroupSize.x) {
         CellSamples sample_cell = sample_buffer.samples[i];
         ivec3 c = sample_cell.coord.xyz;
+
+        /* Halo cells provide neighbour data only; they never emit geometry, so
+         * each boundary quad is produced exactly once across adjacent chunks. */
+        if (!cell_is_owned(c)) {
+            continue;
+        }
 
         float s0 = sample_at(sample_cell, 0u);
         float sx = sample_at(sample_cell, 1u);

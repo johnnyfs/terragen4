@@ -658,16 +658,16 @@ ensure_depth_texture(AppState *state, uint32_t width, uint32_t height) {
     return true;
 }
 
+/* Phase 2 scaffolding: build one chunk at its true world position. The cache /
+ * pool / per-frame selection that manages many chunks arrives in Phase 3. */
 static bool
-initialize_terrain(AppState *state) {
-    state->terrain_config = terrain_default_region_config();
-    state->terrain_detail = state->terrain_config.size_x;
-    if (!sparse_grid_create_dense(&state->sparse_grid, &state->terrain_config)) {
-        log_error("Could not create sparse terrain grid");
+build_single_chunk(AppState *state, int32_t cx, int32_t cz, uint32_t lod) {
+    if (!sparse_grid_create_chunk(&state->sparse_grid, &state->terrain_config, lod, cx, cz)) {
+        log_error("Could not create chunk sparse grid");
         return false;
     }
-
-    if (!terrain_gpu_init(state->device, &state->terrain_config, &state->sparse_grid, &state->terrain)) {
+    const ChunkLayout layout = sparse_grid_chunk_layout(&state->terrain_config, lod, cx, cz);
+    if (!terrain_gpu_init(state->device, &state->terrain_config, &state->sparse_grid, &layout, &state->terrain)) {
         return false;
     }
 
@@ -677,20 +677,11 @@ initialize_terrain(AppState *state) {
     return true;
 }
 
-static void
-configure_terrain_detail(AppState *state, uint32_t detail) {
-    if (detail < TERRAIN_MIN_DETAIL) {
-        detail = TERRAIN_MIN_DETAIL;
-    }
-    if (detail > TERRAIN_MAX_DETAIL) {
-        detail = TERRAIN_MAX_DETAIL;
-    }
-
-    state->terrain_detail = detail;
-    state->terrain_config.size_x = detail;
-    state->terrain_config.size_z = detail;
-    state->terrain_config.grid_resolution = TERRAIN_WORLD_SIZE / (float)detail;
-    terrain_region_apply_height_range(&state->terrain_config);
+static bool
+initialize_terrain(AppState *state) {
+    state->terrain_config = terrain_default_region_config();
+    state->terrain_detail = state->terrain_config.size_x;
+    return build_single_chunk(state, 0, 0, 0u);
 }
 
 static bool
@@ -702,18 +693,9 @@ regenerate_terrain(AppState *state) {
     terrain_gpu_destroy(state->device, &state->terrain);
     sparse_grid_destroy(&state->sparse_grid);
 
-    configure_terrain_detail(state, state->terrain_detail);
-    if (!sparse_grid_create_dense(&state->sparse_grid, &state->terrain_config)) {
-        log_error("Could not rebuild sparse terrain grid");
+    if (!build_single_chunk(state, 0, 0, 0u)) {
         return false;
     }
-    if (!terrain_gpu_init(state->device, &state->terrain_config, &state->sparse_grid, &state->terrain)) {
-        return false;
-    }
-
-    SDL_GPUCommandBuffer *command_buffer = SDL_AcquireGPUCommandBuffer(state->device);
-    terrain_gpu_generate(command_buffer, &state->terrain);
-    SDL_SubmitGPUCommandBuffer(command_buffer);
 
     const uint64_t end = SDL_GetPerformanceCounter();
     state->last_regen_ms = (float)((double)(end - start) * 1000.0 / (double)frequency);
@@ -780,11 +762,11 @@ SDL_AppInit(void **appstate, int argc, char *argv[]) {
     if (smoke_frames != NULL) {
         state->smoke_frame_limit = (uint32_t)SDL_atoi(smoke_frames);
     }
-    state->camera_position[0] = 0.0f;
-    state->camera_position[1] = 26.0f;
-    state->camera_position[2] = -72.0f;
+    state->camera_position[0] = 16.0f;
+    state->camera_position[1] = 30.0f;
+    state->camera_position[2] = -28.0f;
     state->camera_yaw = 0.0f;
-    state->camera_pitch = -0.24f;
+    state->camera_pitch = -0.35f;
     state->camera_fov_degrees = 60.0f;
     state->fps = 0.0f;
     state->last_frame_ticks = SDL_GetPerformanceCounter();

@@ -3,10 +3,14 @@
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(std140, set = 2, binding = 0) uniform TerrainParams {
-    uvec4 counts;
-    ivec4 bounds;
-    vec4 noise;
-    vec4 field;
+    uvec4 counts;  // cell_count, array_dim_x, array_dim_z, max_vertices
+    ivec4 bounds;  // local_min_y, array_dim_y, seed, octaves
+    vec4 noise;    // cell_size, noise_freq, noise_amp, base_height
+    vec4 field;    // warp_amount, warp_freq, lacunarity, gain
+    vec4 chunk;    // origin_x, origin_y, origin_z, skirt_depth
+    ivec4 lmin;    // local_min_x, local_min_z, _, _
+    ivec4 omin;    // owned_min_x, owned_min_y, owned_min_z, _
+    ivec4 odim;    // owned_dim_x, owned_dim_y, owned_dim_z, _
 } params;
 
 struct CellSamples {
@@ -122,11 +126,12 @@ float sample_at(CellSamples cell, uint index) {
 
 vec3 corner_position(ivec3 coord, uint corner) {
     float r = params.noise.x;
-    return vec3(
+    vec3 local = vec3(
         float(coord.x) + float(corner & 1u),
         float(coord.y) + float((corner >> 2u) & 1u),
         float(coord.z) + float((corner >> 1u) & 1u)
-    ) * r;
+    );
+    return params.chunk.xyz + local * r;
 }
 
 void main() {
