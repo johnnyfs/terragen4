@@ -65,6 +65,9 @@ typedef struct AppState {
     uint32_t dbg_evictions;
     uint32_t dbg_generated;
     uint32_t dbg_failed;
+    uint32_t dbg_resident;
+    uint32_t dbg_queue;
+    uint32_t dbg_lod[CHUNK_LOD_COUNT];
 
     uint32_t frame_count;
     uint32_t smoke_frame_limit;
@@ -569,16 +572,39 @@ build_and_upload_hud(AppState *state, SDL_GPUCommandBuffer *command_buffer) {
     hud_emit_text(vertices, &count, x, y, scale, line);
     y += line_step;
 
-    SDL_snprintf(line, sizeof(line), "REGEN %.2f MS", state->last_regen_ms);
+    SDL_snprintf(
+        line,
+        sizeof(line),
+        "CHUNKS A%u R%u  RES %u/%u",
+        state->dbg_active,
+        state->dbg_rendered,
+        state->dbg_resident,
+        (unsigned)CHUNK_POOL_CAPACITY
+    );
     hud_emit_text(vertices, &count, x, y, scale, line);
     y += line_step;
 
     SDL_snprintf(
         line,
         sizeof(line),
-        "DETAIL %uX%u",
-        state->terrain_config.size_x,
-        state->terrain_config.size_z
+        "LOD %u/%u/%u  Q%u",
+        state->dbg_lod[0],
+        CHUNK_LOD_COUNT > 1u ? state->dbg_lod[1] : 0u,
+        CHUNK_LOD_COUNT > 2u ? state->dbg_lod[2] : 0u,
+        state->dbg_queue
+    );
+    hud_emit_text(vertices, &count, x, y, scale, line);
+    y += line_step;
+
+    SDL_snprintf(
+        line,
+        sizeof(line),
+        "HIT%u MISS%u EV%u GEN%u F%u",
+        state->dbg_hits,
+        state->dbg_misses,
+        state->dbg_evictions,
+        state->dbg_generated,
+        state->dbg_failed
     );
     hud_emit_text(vertices, &count, x, y, scale, line);
     y += line_step;
@@ -764,9 +790,15 @@ chunk_system_update(AppState *state) {
     state->dbg_misses = 0u;
     state->dbg_evictions = 0u;
     state->dbg_generated = 0u;
+    for (uint32_t l = 0u; l < CHUNK_LOD_COUNT; l += 1u) {
+        state->dbg_lod[l] = 0u;
+    }
 
     for (size_t i = 0u; i < state->active_count; i += 1u) {
         const ChunkGenKey key = state->active_keys[i];
+        if (key.lod < CHUNK_LOD_COUNT) {
+            state->dbg_lod[key.lod] += 1u;
+        }
         ChunkRecord *rec = chunk_cache_find(&state->chunk_cache, &key);
         if (rec != NULL) {
             rec->last_used_frame = state->frame_count;
@@ -799,30 +831,45 @@ chunk_system_update(AppState *state) {
         }
     }
 
-    if (chunk_queue_size(&state->chunk_cache) == 0u) {
-        return;
+    if (chunk_queue_size(&state->chunk_cache) > 0u) {
+        SDL_GPUCommandBuffer *command_buffer = SDL_AcquireGPUCommandBuffer(state->device);
+        for (uint32_t n = 0u; n < CHUNK_MAX_GEN_PER_FRAME; n += 1u) {
+            ChunkGenKey key;
+            if (!chunk_queue_pop(&state->chunk_cache, &key)) {
+                break;
+            }
+            ChunkRecord *rec = chunk_cache_find(&state->chunk_cache, &key);
+            if (rec == NULL || rec->status != CHUNK_STATUS_QUEUED) {
+                continue; /* evicted or already handled before generation ran */
+            }
+            rec->status = CHUNK_STATUS_GENERATING;
+            if (generate_chunk(state, command_buffer, rec)) {
+                rec->status = CHUNK_STATUS_READY;
+                state->dbg_generated += 1u;
+            } else {
+                rec->status = CHUNK_STATUS_FAILED;
+                state->dbg_failed += 1u;
+            }
+        }
+        SDL_SubmitGPUCommandBuffer(command_buffer);
     }
 
-    SDL_GPUCommandBuffer *command_buffer = SDL_AcquireGPUCommandBuffer(state->device);
-    for (uint32_t n = 0u; n < CHUNK_MAX_GEN_PER_FRAME; n += 1u) {
-        ChunkGenKey key;
-        if (!chunk_queue_pop(&state->chunk_cache, &key)) {
-            break;
-        }
-        ChunkRecord *rec = chunk_cache_find(&state->chunk_cache, &key);
-        if (rec == NULL || rec->status != CHUNK_STATUS_QUEUED) {
-            continue; /* evicted or already handled before generation ran */
-        }
-        rec->status = CHUNK_STATUS_GENERATING;
-        if (generate_chunk(state, command_buffer, rec)) {
-            rec->status = CHUNK_STATUS_READY;
-            state->dbg_generated += 1u;
-        } else {
-            rec->status = CHUNK_STATUS_FAILED;
-            state->dbg_failed += 1u;
-        }
+    state->dbg_resident = (uint32_t)chunk_cache_resident(&state->chunk_cache);
+    state->dbg_queue = (uint32_t)chunk_queue_size(&state->chunk_cache);
+
+    /* Periodic console summary so headless/smoke runs surface the same data. */
+    if ((state->frame_count % 120u) == 0u) {
+        log_info(
+            "chunks active=%u rendered=%u L0/L1/L2=%u/%u/%u resident=%u/%u queue=%u "
+            "hit=%u miss=%u evict=%u gen=%u fail=%u",
+            state->dbg_active, state->dbg_rendered,
+            state->dbg_lod[0], CHUNK_LOD_COUNT > 1u ? state->dbg_lod[1] : 0u,
+            CHUNK_LOD_COUNT > 2u ? state->dbg_lod[2] : 0u,
+            state->dbg_resident, (unsigned)CHUNK_POOL_CAPACITY, state->dbg_queue,
+            state->dbg_hits, state->dbg_misses, state->dbg_evictions,
+            state->dbg_generated, state->dbg_failed
+        );
     }
-    SDL_SubmitGPUCommandBuffer(command_buffer);
 }
 
 static void
