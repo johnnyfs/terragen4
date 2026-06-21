@@ -8,7 +8,7 @@ layout(std140, set = 2, binding = 0) uniform TerrainParams {
     vec4 noise;    // cell_size, noise_freq, noise_amp, base_height
     vec4 field;    // warp_amount, warp_freq, lacunarity, gain
     vec4 chunk;    // origin_x, origin_y, origin_z, skirt_depth
-    ivec4 lmin;    // local_min_x, local_min_z, _, _
+    ivec4 lmin;    // local_min_x, local_min_z, region_id, _
     ivec4 omin;    // owned_min_x, owned_min_y, owned_min_z, _
     ivec4 odim;    // owned_dim_x, owned_dim_y, owned_dim_z, _
 } params;
@@ -86,15 +86,25 @@ bool cell_is_owned(ivec3 c) {
            c.z >= params.omin.z && c.z < params.omin.z + params.odim.z;
 }
 
-vec4 terrain_color(float y, vec3 normal) {
-    vec3 grass = vec3(0.18, 0.40, 0.23);
-    vec3 earth = vec3(0.42, 0.34, 0.24);
-    vec3 rock = vec3(0.58, 0.56, 0.50);
-    float elevation = clamp((y - params.noise.w + params.noise.z) / max(params.noise.z * 2.0, 0.001), 0.0, 1.0);
+/* Logical material ids; must match materials.h (MATERIAL_FLAT=0, MATERIAL_SLOPE=1).
+ * The fragment shader maps these into the active palette's texture-array layers. */
+const float MAT_FLAT = 0.0;
+const float MAT_SLOPE = 1.0;
+
+/*
+ * Pick the materials for a surface point. Returns (material_a, material_b, blend,
+ * texel_scale): the fragment shader samples both materials from the texture array
+ * and lerps a->b by `blend`. texel_scale is the world cell size at this LOD so
+ * coarse (distant) chunks tile the source texture proportionally larger.
+ *
+ * region_id is reserved for the future region graph: region 0 is the default
+ * grass-on-flat / rock-on-slope assignment, but a region can later select a
+ * different material pair without touching the texturing or lighting path.
+ */
+vec4 terrain_material(vec3 world_pos, vec3 normal, int region_id) {
     float slope = 1.0 - clamp(normal.y, 0.0, 1.0);
-    vec3 base = mix(grass, earth, elevation);
-    vec3 color = mix(base, rock, clamp(slope * 1.4, 0.0, 1.0));
-    return vec4(color, 1.0);
+    float blend = smoothstep(0.30, 0.62, slope);
+    return vec4(MAT_FLAT, MAT_SLOPE, blend, params.noise.x);
 }
 
 MeshVertex make_vertex(HermiteCell cell) {
@@ -105,7 +115,7 @@ MeshVertex make_vertex(HermiteCell cell) {
      * adds the chunk origin), so no centering offset is applied here. */
     v.position = vec4(p.x, p.y, p.z, 1.0);
     v.normal = vec4(n, 0.0);
-    v.color = terrain_color(p.y, n);
+    v.color = terrain_material(p, n, params.lmin.z);
     return v;
 }
 
@@ -202,7 +212,7 @@ void emit_border_skirts(ivec3 c) {
     }
     vec3 p = self.position.xyz;
     vec3 n = normalize(self.normal_crossings.xyz);
-    vec4 color = terrain_color(p.y, n);
+    vec4 color = terrain_material(p, n, params.lmin.z);
     float half_width = params.noise.x * 0.5;
     if (nx || px) {
         emit_skirt(p, n, color, vec3(0.0, 0.0, 1.0), half_width, depth);

@@ -37,7 +37,7 @@ add_executable(terragen ${sources})
 add_dependencies(terragen CompileShaders)
 
 target_compile_options(terragen PUBLIC -std=c23 -Wall -Wfloat-conversion)
-target_include_directories(terragen PUBLIC src/main ${SDL3_INCLUDE_DIRS})
+target_include_directories(terragen PUBLIC src/main third_party ${SDL3_INCLUDE_DIRS})
 target_link_libraries(terragen ${SDL3_LIBRARIES} m)
 
 add_custom_command(
