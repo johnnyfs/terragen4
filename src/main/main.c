@@ -500,6 +500,14 @@ glyph_row(char c, int row) {
         case '.': return row == 6 ? 0x04u : 0x00u;
         case ':': return (row == 2 || row == 5) ? 0x04u : 0x00u;
         case 'X': return letters['X' - 'A'][row];
+        case '[': {
+            static const uint8_t lb[7] = {0x0eu, 0x08u, 0x08u, 0x08u, 0x08u, 0x08u, 0x0eu};
+            return lb[row];
+        }
+        case ']': {
+            static const uint8_t rb[7] = {0x0eu, 0x02u, 0x02u, 0x02u, 0x02u, 0x02u, 0x0eu};
+            return rb[row];
+        }
         default: return 0x00u;
     }
 }
@@ -570,7 +578,7 @@ build_and_upload_hud(AppState *state, SDL_GPUCommandBuffer *command_buffer) {
     SDL_snprintf(
         line,
         sizeof(line),
-        "HEIGHT %.1f / %.1f",
+        "J/K HEIGHT %.1f / %.1f",
         state->terrain_config.min_height,
         state->terrain_config.max_height
     );
@@ -625,20 +633,23 @@ build_and_upload_hud(AppState *state, SDL_GPUCommandBuffer *command_buffer) {
     hud_emit_text(vertices, &count, x, y, scale, line);
     y += line_step;
 
-    SDL_snprintf(line, sizeof(line), "ZOOM %.1f DEG", state->camera_fov_degrees);
+    SDL_snprintf(line, sizeof(line), "WHEEL ZOOM %.1f DEG", state->camera_fov_degrees);
     hud_emit_text(vertices, &count, x, y, scale, line);
     y += line_step;
 
-    SDL_snprintf(line, sizeof(line), "WARP %.1f", state->terrain_config.warp_amount);
+    SDL_snprintf(line, sizeof(line), "U/I WARP %.1f", state->terrain_config.warp_amount);
     hud_emit_text(vertices, &count, x, y, scale, line);
     y += line_step;
 
-    SDL_snprintf(line, sizeof(line), "FREQ %.3f", state->terrain_config.noise_frequency);
+    SDL_snprintf(line, sizeof(line), "N/M FREQ %.3f", state->terrain_config.noise_frequency);
     hud_emit_text(vertices, &count, x, y, scale, line);
     y += line_step;
 
-    SDL_snprintf(line, sizeof(line), "OCTAVES %u", state->terrain_config.noise_octaves);
+    SDL_snprintf(line, sizeof(line), "[/] OCTAVES %u", state->terrain_config.noise_octaves);
     hud_emit_text(vertices, &count, x, y, scale, line);
+    y += line_step;
+
+    hud_emit_text(vertices, &count, x, y, scale, "WASD MOVE  MMB UP/DOWN  ESC MOUSE");
 
     SDL_UnmapGPUTransferBuffer(state->device, state->hud_transfer_buffer);
     state->hud_vertex_count = count;
@@ -971,12 +982,13 @@ SDL_AppInit(void **appstate, int argc, char *argv[]) {
     if (smoke_drift != NULL) {
         state->smoke_drift = (float)SDL_atof(smoke_drift);
     }
-    /* Spawn near the center of the finite region, looking across the terrain. */
+    /* Overlook the region from near its center, matching the original gentle
+     * downward framing (camera above the terrain, looking across it). */
     state->camera_position[0] = chunk_region_extent() * 0.5f;
-    state->camera_position[1] = 44.0f;
-    state->camera_position[2] = chunk_region_extent() * 0.5f - 40.0f;
+    state->camera_position[1] = 34.0f;
+    state->camera_position[2] = chunk_region_extent() * 0.5f - 78.0f;
     state->camera_yaw = 0.0f;
-    state->camera_pitch = -0.38f;
+    state->camera_pitch = -0.24f;
     state->camera_fov_degrees = 60.0f;
     state->fps = 0.0f;
     state->last_frame_ticks = SDL_GetPerformanceCounter();
