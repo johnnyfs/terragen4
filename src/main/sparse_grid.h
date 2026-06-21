@@ -49,9 +49,11 @@ typedef struct ChunkLayout {
     int32_t owned_dim_z;
 } ChunkLayout;
 
+ChunkLayout sparse_grid_chunk_layout_packet(const TerrainFieldPacket *packet, uint32_t lod, int32_t cx, int32_t cz);
 ChunkLayout sparse_grid_chunk_layout(const TerrainRegionConfig *config, uint32_t lod, int32_t cx, int32_t cz);
 
 bool sparse_grid_create_dense(SparseGrid *grid, const TerrainRegionConfig *config);
+bool sparse_grid_create_chunk_packet(SparseGrid *grid, const TerrainFieldPacket *packet, uint32_t lod, int32_t cx, int32_t cz);
 bool sparse_grid_create_chunk(SparseGrid *grid, const TerrainRegionConfig *config, uint32_t lod, int32_t cx, int32_t cz);
 void sparse_grid_destroy(SparseGrid *grid);
 

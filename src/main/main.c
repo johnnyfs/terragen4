@@ -86,6 +86,7 @@ typedef struct AppState {
     uint32_t hud_vertex_count;
 
     TerrainRegionConfig terrain_config;
+    TerrainWorld terrain_world;
 
     /* Chunk system: a pool of GPU pipelines indexed by cache record slots. */
     ChunkCache chunk_cache;
@@ -856,16 +857,13 @@ ensure_depth_texture(AppState *state, uint32_t width, uint32_t height) {
 static bool
 initialize_terrain(AppState *state) {
     state->terrain_config = terrain_default_region_config();
-    /* Demo peaks clustered around the region centre, where the camera starts
-     * and looks (see reset_camera), so the feature is visible on launch:
-     * a broad tall mountain, a steeper mid peak, and a narrow spike. */
+    terrain_world_init(&state->terrain_world, &state->terrain_config);
+    /* Demo features cluster around the region centre, where the camera starts
+     * and looks (see reset_camera), so authored features are visible on launch. */
     const float cx = chunk_region_extent() * 0.5f;
     const float cz = chunk_region_extent() * 0.5f;
-    state->terrain_config.peak_count = 3u;
-    state->terrain_config.peaks[0] = (TerrainPeak){.pos_x = cx,         .pos_z = cz,         .intensity = 24.0f, .sharpness = 0.12f};
-    state->terrain_config.peaks[1] = (TerrainPeak){.pos_x = cx + 45.0f, .pos_z = cz - 25.0f, .intensity = 16.0f, .sharpness = 0.20f};
-    state->terrain_config.peaks[2] = (TerrainPeak){.pos_x = cx - 40.0f, .pos_z = cz + 20.0f, .intensity = 12.0f, .sharpness = 0.35f};
-    state->density_version = terrain_density_hash(&state->terrain_config);
+    terrain_world_add_demo_features(&state->terrain_world, cx, cz);
+    state->density_version = terrain_density_hash(&state->terrain_world.base);
 
     state->pool_capacity = CHUNK_POOL_CAPACITY_DEFAULT;
     const char *pool_env = getenv("TERRAGEN_POOL");
@@ -904,26 +902,45 @@ chunk_key_center(ChunkGenKey key, float *out_x, float *out_z) {
     *out_z = (b.min_z + b.max_z) * 0.5f;
 }
 
+static bool
+field_packet_for_key(const TerrainWorld *world, ChunkGenKey key, TerrainFieldPacket *out_packet) {
+    const ChunkCoord coord = {.cx = key.cx, .cz = key.cz, .lod = key.lod};
+    const ChunkAabb2 b = chunk_bounds(coord);
+    return terrain_world_build_packet(world, key.region_id, b.min_x, b.min_z, b.max_x, b.max_z, out_packet);
+}
+
 /* Generate (or repoint+regenerate) the chunk for rec into its pool slot. */
 static bool
 generate_chunk(AppState *state, SDL_GPUCommandBuffer *command_buffer, ChunkRecord *rec) {
     const ChunkGenKey key = rec->key;
     TerrainGpuPipeline *pipe = &state->chunk_pool[rec->slot];
-    const ChunkLayout layout = sparse_grid_chunk_layout(&state->terrain_config, key.lod, key.cx, key.cz);
+    TerrainFieldPacket packet = {0};
+    if (!field_packet_for_key(&state->terrain_world, key, &packet)) {
+        log_error(
+            "Chunk %d,%d LOD %u has %u active terrain features over the packet cap %u",
+            key.cx,
+            key.cz,
+            key.lod,
+            packet.overflow_count,
+            (unsigned)TERRAIN_MAX_ACTIVE_FEATURES
+        );
+        return false;
+    }
+    const ChunkLayout layout = sparse_grid_chunk_layout_packet(&packet, key.lod, key.cx, key.cz);
     const uint32_t cell_count =
         (uint32_t)(layout.array_dim_x * layout.array_dim_y * layout.array_dim_z);
 
-    if (!terrain_gpu_reuse(pipe, &state->terrain_config, &layout, cell_count)) {
+    if (!terrain_gpu_reuse(pipe, &packet, &layout, cell_count)) {
         /* The slot held a different-sized chunk (or none): rebuild its buffers.
          * Same-LOD reuse above keeps the common case allocation-free. */
         if (pipe->sample_pipeline != NULL) {
             terrain_gpu_destroy(state->device, pipe);
         }
         SparseGrid grid = {0};
-        if (!sparse_grid_create_chunk(&grid, &state->terrain_config, key.lod, key.cx, key.cz)) {
+        if (!sparse_grid_create_chunk_packet(&grid, &packet, key.lod, key.cx, key.cz)) {
             return false;
         }
-        const bool ok = terrain_gpu_init(state->device, &state->terrain_config, &grid, &layout, pipe);
+        const bool ok = terrain_gpu_init(state->device, &packet, &grid, &layout, pipe);
         sparse_grid_destroy(&grid);
         if (!ok) {
             return false;
@@ -954,13 +971,22 @@ chunk_system_update(AppState *state) {
 
     /* Content-addressed density version: identical params reuse cached chunks
      * exactly (so reverting a setting heals instantly), any change invalidates. */
-    state->density_version = terrain_density_hash(&state->terrain_config);
+    state->terrain_world.base = state->terrain_config;
+    state->density_version = terrain_density_hash(&state->terrain_world.base);
 
     state->active_count = chunk_active_set_hyst(
         pov_x, pov_z, CHUNK_REGION_TEST,
         state->density_version, 1u, materials_version_hash(), state->active_keys, CHUNK_MAX_ACTIVE,
         state->prev_active_keys, state->prev_active_count, CHUNK_LOD_HYSTERESIS
     );
+    for (size_t i = 0u; i < state->active_count && i < CHUNK_MAX_ACTIVE; i += 1u) {
+        TerrainFieldPacket packet = {0};
+        if (field_packet_for_key(&state->terrain_world, state->active_keys[i], &packet)) {
+            state->active_keys[i].density_version = terrain_field_packet_hash(&packet);
+        } else {
+            state->active_keys[i].density_version = terrain_hash_u32(state->density_version ^ packet.overflow_count);
+        }
+    }
 
     state->dbg_active = (uint32_t)state->active_count;
     state->dbg_hits = 0u;
@@ -1141,19 +1167,21 @@ chunk_system_render(AppState *state, SDL_GPURenderPass *render_pass) {
  * is negative inside solid terrain and positive in air. No chunk data is required,
  * so this works anywhere in the streamed region. */
 static float
-find_ground_y(const TerrainRegionConfig *cfg, float x, float z) {
-    float y_hi = cfg->max_height + 32.0f; /* expected to be air */
-    float y_lo = cfg->min_height - 32.0f; /* expected to be solid */
+find_ground_y(const TerrainWorld *world, float x, float z) {
+    TerrainFieldPacket packet = {0};
+    (void)terrain_world_build_packet(world, CHUNK_REGION_TEST, x, z, x, z, &packet);
+    float y_hi = world->base.max_height + 32.0f; /* expected to be air */
+    float y_lo = world->base.min_height - 32.0f; /* expected to be solid */
     /* Guard the brackets in case the expected sign does not hold. */
-    if (terrain_density_sample(cfg, x, y_hi, z) <= 0.0f) {
+    if (terrain_field_density_sample(&packet, x, y_hi, z) <= 0.0f) {
         return y_hi;
     }
-    if (terrain_density_sample(cfg, x, y_lo, z) >= 0.0f) {
+    if (terrain_field_density_sample(&packet, x, y_lo, z) >= 0.0f) {
         return y_lo;
     }
     for (int i = 0; i < 24; i += 1) {
         const float mid = (y_hi + y_lo) * 0.5f;
-        if (terrain_density_sample(cfg, x, mid, z) > 0.0f) {
+        if (terrain_field_density_sample(&packet, x, mid, z) > 0.0f) {
             y_hi = mid; /* air */
         } else {
             y_lo = mid; /* solid */
@@ -1316,7 +1344,7 @@ update_camera_ground(AppState *state, float dt) {
     state->velocity_y -= CAM_GRAVITY * dt;
     state->camera_position[1] += state->velocity_y * dt;
     const float floor_y = find_ground_y(
-        &state->terrain_config,
+        &state->terrain_world,
         state->camera_position[0],
         state->camera_position[2]
     ) + CAM_EYE_HEIGHT;
@@ -1547,7 +1575,7 @@ SDL_AppEvent(void *appstate, SDL_Event *event) {
                 if (state->camera_mode == CAM_GROUND) {
                     /* Drop the view to just above the surface immediately. */
                     state->camera_position[1] = find_ground_y(
-                        &state->terrain_config,
+                        &state->terrain_world,
                         state->camera_position[0],
                         state->camera_position[2]
                     ) + CAM_EYE_HEIGHT;
@@ -1621,6 +1649,7 @@ SDL_AppEvent(void *appstate, SDL_Event *event) {
              * from the config each frame (content-addressed), so changed params
              * invalidate chunks and reverted params reuse the cached ones. */
             terrain_region_apply_height_range(&state->terrain_config);
+            state->terrain_world.base = state->terrain_config;
         }
     }
 

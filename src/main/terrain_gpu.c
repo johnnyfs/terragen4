@@ -11,10 +11,14 @@ typedef struct TerrainGpuParams {
     float noise[4];      /* cell_size, noise_freq, noise_amp, base_height */
     float field[4];      /* warp_amount, warp_freq, lacunarity, gain */
     float chunk[4];      /* origin_x, origin_y, origin_z, skirt_depth */
-    int32_t lmin[4];     /* local_min_x, local_min_z, region_id, peak_count */
+    int32_t lmin[4];     /* local_min_x, local_min_z, region_id, feature_count */
     int32_t omin[4];     /* owned_min_x, owned_min_y, owned_min_z, _ */
     int32_t odim[4];     /* owned_dim_x, owned_dim_y, owned_dim_z, _ */
-    float peaks[TERRAIN_MAX_PEAKS][4]; /* pos_x, pos_z, intensity, sharpness */
+    int32_t feature_meta[TERRAIN_MAX_ACTIVE_FEATURES][4]; /* type, region, priority, min_lod */
+    float feature_data0[TERRAIN_MAX_ACTIVE_FEATURES][4];  /* pos_x, pos_y, pos_z, radius */
+    float feature_data1[TERRAIN_MAX_ACTIVE_FEATURES][4];  /* extent_x, extent_y, extent_z, intensity */
+    float feature_data2[TERRAIN_MAX_ACTIVE_FEATURES][4];  /* dir_x, dir_y, dir_z, sharpness */
+    float feature_data3[TERRAIN_MAX_ACTIVE_FEATURES][4];  /* falloff, material, _, _ */
 } TerrainGpuParams;
 
 typedef struct CellSamplesGpu {
@@ -86,9 +90,11 @@ create_buffer(SDL_GPUDevice *device, SDL_GPUBufferUsageFlags usage, uint32_t siz
 static TerrainGpuParams
 make_params(const TerrainGpuPipeline *pipeline) {
     const ChunkLayout *layout = &pipeline->layout;
-    const uint32_t peak_count = pipeline->config.peak_count < TERRAIN_MAX_PEAKS
-        ? pipeline->config.peak_count
-        : TERRAIN_MAX_PEAKS;
+    const TerrainFieldPacket *packet = &pipeline->field_packet;
+    const TerrainRegionConfig *config = &packet->base;
+    const uint32_t feature_count = packet->feature_count < TERRAIN_MAX_ACTIVE_FEATURES
+        ? packet->feature_count
+        : TERRAIN_MAX_ACTIVE_FEATURES;
     TerrainGpuParams params = {
         .counts = {
             pipeline->cell_count,
@@ -99,20 +105,20 @@ make_params(const TerrainGpuPipeline *pipeline) {
         .bounds = {
             layout->local_min_y,
             layout->array_dim_y,
-            (int32_t)pipeline->config.seed,
-            (int32_t)pipeline->config.noise_octaves,
+            (int32_t)config->seed,
+            (int32_t)config->noise_octaves,
         },
         .noise = {
             layout->cell_size,
-            pipeline->config.noise_frequency,
-            pipeline->config.noise_amplitude,
-            pipeline->config.base_height,
+            config->noise_frequency,
+            config->noise_amplitude,
+            config->base_height,
         },
         .field = {
-            pipeline->config.warp_amount,
-            pipeline->config.warp_frequency,
-            pipeline->config.noise_lacunarity,
-            pipeline->config.noise_gain,
+            config->warp_amount,
+            config->warp_frequency,
+            config->noise_lacunarity,
+            config->noise_gain,
         },
         .chunk = {
             layout->origin_x,
@@ -123,9 +129,7 @@ make_params(const TerrainGpuPipeline *pipeline) {
              * this chunk has no transition borders. */
             pipeline->seam_mask != 0u ? layout->cell_size * 8.0f : 0.0f,
         },
-        /* region_id is fixed to the single test region today; the future region
-         * graph will supply per-chunk ids so regions can pick distinct materials. */
-        .lmin = {layout->local_min_x, layout->local_min_z, (int32_t)CHUNK_REGION_TEST, (int32_t)peak_count},
+        .lmin = {layout->local_min_x, layout->local_min_z, (int32_t)packet->region_id, (int32_t)feature_count},
         .omin = {
             layout->owned_min_x,
             layout->owned_min_y,
@@ -134,12 +138,26 @@ make_params(const TerrainGpuPipeline *pipeline) {
         },
         .odim = {layout->owned_dim_x, layout->owned_dim_y, layout->owned_dim_z, 0},
     };
-    for (uint32_t i = 0u; i < peak_count; i += 1u) {
-        const TerrainPeak *peak = &pipeline->config.peaks[i];
-        params.peaks[i][0] = peak->pos_x;
-        params.peaks[i][1] = peak->pos_z;
-        params.peaks[i][2] = peak->intensity;
-        params.peaks[i][3] = peak->sharpness;
+    for (uint32_t i = 0u; i < feature_count; i += 1u) {
+        const TerrainFeature *feature = &packet->features[i];
+        params.feature_meta[i][0] = (int32_t)feature->type;
+        params.feature_meta[i][1] = (int32_t)feature->region_id;
+        params.feature_meta[i][2] = (int32_t)feature->priority;
+        params.feature_meta[i][3] = feature->min_lod == UINT32_MAX ? -1 : (int32_t)feature->min_lod;
+        params.feature_data0[i][0] = feature->position[0];
+        params.feature_data0[i][1] = feature->position[1];
+        params.feature_data0[i][2] = feature->position[2];
+        params.feature_data0[i][3] = feature->influence_radius;
+        params.feature_data1[i][0] = feature->extent[0];
+        params.feature_data1[i][1] = feature->extent[1];
+        params.feature_data1[i][2] = feature->extent[2];
+        params.feature_data1[i][3] = feature->intensity;
+        params.feature_data2[i][0] = feature->direction[0];
+        params.feature_data2[i][1] = feature->direction[1];
+        params.feature_data2[i][2] = feature->direction[2];
+        params.feature_data2[i][3] = feature->sharpness;
+        params.feature_data3[i][0] = feature->falloff;
+        params.feature_data3[i][1] = feature->material;
     }
     return params;
 }
@@ -186,9 +204,9 @@ upload_grid_coords(SDL_GPUDevice *device, const SparseGrid *grid, TerrainGpuPipe
 }
 
 bool
-terrain_gpu_init(SDL_GPUDevice *device, const TerrainRegionConfig *config, const SparseGrid *grid, const ChunkLayout *layout, TerrainGpuPipeline *pipeline) {
+terrain_gpu_init(SDL_GPUDevice *device, const TerrainFieldPacket *packet, const SparseGrid *grid, const ChunkLayout *layout, TerrainGpuPipeline *pipeline) {
     *pipeline = (TerrainGpuPipeline) {0};
-    pipeline->config = *config;
+    pipeline->field_packet = *packet;
     pipeline->layout = *layout;
     pipeline->cell_count = (uint32_t)grid->count;
     /* Budget vertices by owned surface area with headroom for a few stacked
@@ -273,14 +291,14 @@ terrain_gpu_init(SDL_GPUDevice *device, const TerrainRegionConfig *config, const
 }
 
 bool
-terrain_gpu_reuse(TerrainGpuPipeline *pipeline, const TerrainRegionConfig *config, const ChunkLayout *layout, uint32_t cell_count) {
+terrain_gpu_reuse(TerrainGpuPipeline *pipeline, const TerrainFieldPacket *packet, const ChunkLayout *layout, uint32_t cell_count) {
     if (pipeline->sample_pipeline == NULL || pipeline->cell_count != cell_count) {
         return false;
     }
     /* The uploaded local coordinates are identical for a given LOD, so buffers
      * are reused; the per-chunk origin AND the density parameters still differ,
      * so both must be refreshed or a reused slot would sample with stale params. */
-    pipeline->config = *config;
+    pipeline->field_packet = *packet;
     pipeline->layout = *layout;
     const uint32_t owned_area = (uint32_t)(layout->owned_dim_x * layout->owned_dim_z);
     pipeline->max_vertices = owned_area > 0u ? owned_area * 72u : 6u;

@@ -60,6 +60,85 @@ terrain_region_snap_height_bounds(const TerrainRegionConfig *config) {
     };
 }
 
+static float
+terrain_feature_radius(const TerrainFeature *feature) {
+    if (feature->influence_radius > 0.0f) {
+        return feature->influence_radius;
+    }
+    switch (feature->type) {
+        case TERRAIN_FEATURE_PEAK:
+        case TERRAIN_FEATURE_RIDGE:
+        case TERRAIN_FEATURE_RIVERBED_TROUGH: {
+            const float sharpness = fmaxf(feature->sharpness, 1e-4f);
+            const float amplitude = fmaxf(fabsf(feature->intensity), 1.0f);
+            return logf(amplitude / 0.10f) / sharpness + fmaxf(feature->extent[0], feature->extent[2]);
+        }
+        case TERRAIN_FEATURE_VALLEY_FLOOR:
+        case TERRAIN_FEATURE_PLATEAU:
+        case TERRAIN_FEATURE_CAVE_SUBTRACT:
+        case TERRAIN_FEATURE_CLIFF_CUT:
+        case TERRAIN_FEATURE_BOX_SOLID:
+        case TERRAIN_FEATURE_BOX_CUT:
+        case TERRAIN_FEATURE_CYLINDER_SOLID:
+            return fmaxf(fmaxf(feature->extent[0], feature->extent[1]), feature->extent[2]) + fmaxf(feature->falloff, 0.0f);
+        default:
+            return 0.0f;
+    }
+}
+
+static float
+terrain_feature_vertical_headroom(const TerrainFeature *feature) {
+    switch (feature->type) {
+        case TERRAIN_FEATURE_PEAK:
+        case TERRAIN_FEATURE_RIDGE:
+            return fmaxf(feature->intensity, 0.0f);
+        case TERRAIN_FEATURE_PLATEAU:
+        case TERRAIN_FEATURE_VALLEY_FLOOR:
+            return fmaxf(feature->position[1] - feature->extent[1], 0.0f);
+        case TERRAIN_FEATURE_BOX_SOLID:
+        case TERRAIN_FEATURE_CYLINDER_SOLID:
+            return fmaxf(feature->position[1] + feature->extent[1], 0.0f);
+        default:
+            return 0.0f;
+    }
+}
+
+static float
+terrain_feature_vertical_footroom(const TerrainFeature *feature) {
+    switch (feature->type) {
+        case TERRAIN_FEATURE_RIVERBED_TROUGH:
+            return fmaxf(feature->intensity, 0.0f);
+        case TERRAIN_FEATURE_CAVE_SUBTRACT:
+        case TERRAIN_FEATURE_BOX_CUT:
+        case TERRAIN_FEATURE_CLIFF_CUT:
+            return fmaxf(feature->extent[1] + feature->falloff, 0.0f);
+        case TERRAIN_FEATURE_BOX_SOLID:
+        case TERRAIN_FEATURE_CYLINDER_SOLID:
+            return fmaxf(-(feature->position[1] - feature->extent[1]), 0.0f);
+        default:
+            return 0.0f;
+    }
+}
+
+TerrainHeightBounds
+terrain_field_packet_snap_height_bounds(const TerrainFieldPacket *packet) {
+    TerrainRegionConfig base = packet->base;
+    base.peak_count = 0u;
+    const float resolution = base.grid_resolution > 0.0f ? base.grid_resolution : 1.0f;
+    float min_height = base.min_height;
+    float max_height = base.max_height;
+    for (uint32_t i = 0u; i < packet->feature_count && i < TERRAIN_MAX_ACTIVE_FEATURES; i += 1u) {
+        min_height -= terrain_feature_vertical_footroom(&packet->features[i]);
+        max_height += terrain_feature_vertical_headroom(&packet->features[i]);
+    }
+    const int32_t min_y = (int32_t)floorf(min_height / resolution);
+    const int32_t max_y = (int32_t)ceilf(max_height / resolution);
+    return (TerrainHeightBounds) {
+        .min_y = min_y,
+        .max_y = max_y < min_y ? min_y : max_y,
+    };
+}
+
 uint32_t
 terrain_hash_u32(uint32_t x) {
     x ^= x >> 16u;
@@ -70,8 +149,8 @@ terrain_hash_u32(uint32_t x) {
     return x;
 }
 
-static uint32_t
-terrain_mix_f32(uint32_t acc, float value) {
+uint32_t
+terrain_hash_f32(uint32_t acc, float value) {
     uint32_t bits = 0u;
     memcpy(&bits, &value, sizeof(bits));
     return terrain_hash_u32(acc ^ terrain_hash_u32(bits + 0x9e3779b9u));
@@ -80,13 +159,13 @@ terrain_mix_f32(uint32_t acc, float value) {
 uint32_t
 terrain_density_hash(const TerrainRegionConfig *config) {
     uint32_t h = terrain_hash_u32(config->seed + 0x01234567u);
-    h = terrain_mix_f32(h, config->noise_frequency);
-    h = terrain_mix_f32(h, config->noise_amplitude);
-    h = terrain_mix_f32(h, config->base_height);
-    h = terrain_mix_f32(h, config->warp_amount);
-    h = terrain_mix_f32(h, config->warp_frequency);
-    h = terrain_mix_f32(h, config->noise_lacunarity);
-    h = terrain_mix_f32(h, config->noise_gain);
+    h = terrain_hash_f32(h, config->noise_frequency);
+    h = terrain_hash_f32(h, config->noise_amplitude);
+    h = terrain_hash_f32(h, config->base_height);
+    h = terrain_hash_f32(h, config->warp_amount);
+    h = terrain_hash_f32(h, config->warp_frequency);
+    h = terrain_hash_f32(h, config->noise_lacunarity);
+    h = terrain_hash_f32(h, config->noise_gain);
     h ^= terrain_hash_u32(config->noise_octaves + 0x0000abcdu);
 
     /* Fold in every peak field so edits invalidate cached chunks and reverts
@@ -94,12 +173,76 @@ terrain_density_hash(const TerrainRegionConfig *config) {
     h ^= terrain_hash_u32(config->peak_count + 0x0000fee1u);
     for (uint32_t i = 0u; i < config->peak_count && i < TERRAIN_MAX_PEAKS; i += 1u) {
         const TerrainPeak *peak = &config->peaks[i];
-        h = terrain_mix_f32(h, peak->pos_x);
-        h = terrain_mix_f32(h, peak->pos_z);
-        h = terrain_mix_f32(h, peak->intensity);
-        h = terrain_mix_f32(h, peak->sharpness);
+        h = terrain_hash_f32(h, peak->pos_x);
+        h = terrain_hash_f32(h, peak->pos_z);
+        h = terrain_hash_f32(h, peak->intensity);
+        h = terrain_hash_f32(h, peak->sharpness);
     }
     return terrain_hash_u32(h);
+}
+
+static uint32_t
+terrain_feature_hash(uint32_t h, const TerrainFeature *feature) {
+    h ^= terrain_hash_u32((uint32_t)feature->type + 0x7a13u);
+    h ^= terrain_hash_u32(feature->region_id + 0x45d9f3bu);
+    h ^= terrain_hash_u32(feature->priority + 0x119de1f3u);
+    h ^= terrain_hash_u32(feature->min_lod + 0x3449u);
+    for (uint32_t i = 0u; i < 3u; i += 1u) {
+        h = terrain_hash_f32(h, feature->position[i]);
+        h = terrain_hash_f32(h, feature->extent[i]);
+        h = terrain_hash_f32(h, feature->direction[i]);
+    }
+    h = terrain_hash_f32(h, feature->intensity);
+    h = terrain_hash_f32(h, feature->sharpness);
+    h = terrain_hash_f32(h, feature->falloff);
+    h = terrain_hash_f32(h, feature->influence_radius);
+    h = terrain_hash_f32(h, feature->material);
+    return terrain_hash_u32(h);
+}
+
+uint32_t
+terrain_field_packet_hash(const TerrainFieldPacket *packet) {
+    uint32_t h = terrain_density_hash(&packet->base);
+    h ^= terrain_hash_u32(packet->region_id + 0x63b31u);
+    h ^= terrain_hash_u32(packet->feature_count + 0x51f15eedu);
+    for (uint32_t i = 0u; i < packet->feature_count && i < TERRAIN_MAX_ACTIVE_FEATURES; i += 1u) {
+        h = terrain_feature_hash(h, &packet->features[i]);
+    }
+    return terrain_hash_u32(h);
+}
+
+TerrainFieldPacket
+terrain_field_packet_from_config(const TerrainRegionConfig *config) {
+    TerrainFieldPacket packet = {
+        .base = *config,
+        .region_id = 0u,
+        .feature_count = 0u,
+        .overflow_count = 0u,
+        .min_lod = UINT32_MAX,
+    };
+    for (uint32_t i = 0u; i < config->peak_count && i < TERRAIN_MAX_PEAKS; i += 1u) {
+        if (packet.feature_count >= TERRAIN_MAX_ACTIVE_FEATURES) {
+            packet.overflow_count += 1u;
+            continue;
+        }
+        const TerrainPeak *peak = &config->peaks[i];
+        packet.features[packet.feature_count++] = (TerrainFeature) {
+            .type = TERRAIN_FEATURE_PEAK,
+            .region_id = 0u,
+            .priority = 0u,
+            .min_lod = UINT32_MAX,
+            .position = {peak->pos_x, 0.0f, peak->pos_z},
+            .extent = {0.0f, 0.0f, 0.0f},
+            .direction = {1.0f, 0.0f, 0.0f},
+            .intensity = peak->intensity,
+            .sharpness = peak->sharpness,
+            .falloff = 0.0f,
+            .influence_radius = 0.0f,
+            .material = 0.0f,
+        };
+    }
+    packet.base.peak_count = 0u;
+    return packet;
 }
 
 static float
@@ -196,8 +339,8 @@ terrain_fbm3(const TerrainRegionConfig *config, float x, float y, float z) {
     return normalizer > 0.0f ? sum / normalizer : 0.0f;
 }
 
-float
-terrain_density_sample(const TerrainRegionConfig *config, float x, float y, float z) {
+static float
+terrain_base_displacement(const TerrainRegionConfig *config, float x, float y, float z) {
     const float warp_x = terrain_noise3(config, 311u, x * config->warp_frequency, y * config->warp_frequency, z * config->warp_frequency);
     const float warp_y = terrain_noise3(config, 719u, x * config->warp_frequency, y * config->warp_frequency, z * config->warp_frequency);
     const float warp_z = terrain_noise3(config, 1201u, x * config->warp_frequency, y * config->warp_frequency, z * config->warp_frequency);
@@ -207,21 +350,239 @@ terrain_density_sample(const TerrainRegionConfig *config, float x, float y, floa
     const float broad = terrain_noise3(config, 0u, wx * config->noise_frequency * 0.38f, 0.0f, wz * config->noise_frequency * 0.38f);
     const float detail = terrain_fbm3(config, wx, wy, wz);
     const float ridge = (1.0f - fabsf(terrain_fbm3(config, wx + 53.0f, wy * 0.7f, wz - 29.0f))) * 2.0f - 1.0f;
-    const float displacement = config->noise_amplitude * (broad * 0.55f + detail * 0.30f + ridge * 0.15f);
+    return config->noise_amplitude * (broad * 0.55f + detail * 0.30f + ridge * 0.15f);
+}
 
-    /* Peaks add height (subtract from the SDF) with exponential falloff in the
-     * un-warped XZ plane, so each peak sits exactly at its defined position. */
-    float peak_sum = 0.0f;
-    for (uint32_t i = 0u; i < config->peak_count && i < TERRAIN_MAX_PEAKS; i += 1u) {
-        const TerrainPeak *peak = &config->peaks[i];
-        const float dist = hypotf(x - peak->pos_x, z - peak->pos_z);
-        /* Round the apex over a radius proportional to the peak width
-         * (1/sharpness) so the tip is smooth rather than a sharp cone point,
-         * while the exponential flanks are preserved. */
-        const float round_r = 0.5f / fmaxf(peak->sharpness, 1e-4f);
-        const float soft = sqrtf(dist * dist + round_r * round_r) - round_r;
-        peak_sum += peak->intensity * expf(-peak->sharpness * soft);
+static float
+terrain_saturate(float x) {
+    return fminf(fmaxf(x, 0.0f), 1.0f);
+}
+
+static float
+terrain_smooth_mask(float dist, float radius, float falloff) {
+    if (radius <= 0.0f) {
+        return 0.0f;
+    }
+    const float edge = fmaxf(falloff, 1e-3f);
+    return 1.0f - terrain_smoothstep(terrain_saturate((dist - radius + edge) / edge));
+}
+
+static float
+terrain_signed_box(const float p[3], const TerrainFeature *feature) {
+    const float qx = fabsf(p[0] - feature->position[0]) - fmaxf(feature->extent[0], 0.0f);
+    const float qy = fabsf(p[1] - feature->position[1]) - fmaxf(feature->extent[1], 0.0f);
+    const float qz = fabsf(p[2] - feature->position[2]) - fmaxf(feature->extent[2], 0.0f);
+    const float ox = fmaxf(qx, 0.0f);
+    const float oy = fmaxf(qy, 0.0f);
+    const float oz = fmaxf(qz, 0.0f);
+    const float outside = sqrtf(ox * ox + oy * oy + oz * oz);
+    const float inside = fminf(fmaxf(fmaxf(qx, qy), qz), 0.0f);
+    return outside + inside;
+}
+
+static float
+terrain_signed_cylinder_y(const float p[3], const TerrainFeature *feature) {
+    const float dx = p[0] - feature->position[0];
+    const float dz = p[2] - feature->position[2];
+    const float radial = hypotf(dx, dz) - fmaxf(feature->extent[0], 0.0f);
+    const float vertical = fabsf(p[1] - feature->position[1]) - fmaxf(feature->extent[1], 0.0f);
+    const float ox = fmaxf(radial, 0.0f);
+    const float oy = fmaxf(vertical, 0.0f);
+    return hypotf(ox, oy) + fminf(fmaxf(radial, vertical), 0.0f);
+}
+
+static float
+terrain_feature_height_delta(const TerrainFeature *feature, float x, float current_height, float z) {
+    const float dx = x - feature->position[0];
+    const float dz = z - feature->position[2];
+    switch (feature->type) {
+        case TERRAIN_FEATURE_PEAK: {
+            const float dist = hypotf(dx, dz);
+            const float sharpness = fmaxf(feature->sharpness, 1e-4f);
+            const float round_r = 0.5f / sharpness;
+            const float soft = sqrtf(dist * dist + round_r * round_r) - round_r;
+            return feature->intensity * expf(-sharpness * soft);
+        }
+        case TERRAIN_FEATURE_RIDGE: {
+            const float len = fmaxf(hypotf(feature->direction[0], feature->direction[2]), 1e-4f);
+            const float ux = feature->direction[0] / len;
+            const float uz = feature->direction[2] / len;
+            const float along = dx * ux + dz * uz;
+            const float side = fabsf(dx * -uz + dz * ux);
+            const float half_len = fmaxf(feature->extent[0], 0.0f);
+            const float end = fmaxf(fabsf(along) - half_len, 0.0f);
+            const float dist = hypotf(side, end);
+            return feature->intensity * expf(-fmaxf(feature->sharpness, 1e-4f) * dist);
+        }
+        case TERRAIN_FEATURE_RIVERBED_TROUGH: {
+            const float len = fmaxf(hypotf(feature->direction[0], feature->direction[2]), 1e-4f);
+            const float ux = feature->direction[0] / len;
+            const float uz = feature->direction[2] / len;
+            const float along = dx * ux + dz * uz;
+            const float side = fabsf(dx * -uz + dz * ux);
+            const float half_len = fmaxf(feature->extent[0], 0.0f);
+            const float end = fmaxf(fabsf(along) - half_len, 0.0f);
+            const float dist = hypotf(side, end);
+            return -feature->intensity * expf(-fmaxf(feature->sharpness, 1e-4f) * dist);
+        }
+        case TERRAIN_FEATURE_VALLEY_FLOOR:
+        case TERRAIN_FEATURE_PLATEAU: {
+            const float dist = hypotf(dx, dz);
+            const float mask = terrain_smooth_mask(dist, fmaxf(feature->extent[0], feature->extent[2]), feature->falloff);
+            const float target = feature->position[1];
+            return (target - current_height) * terrain_saturate(feature->intensity) * mask;
+        }
+        default:
+            return 0.0f;
+    }
+}
+
+float
+terrain_field_density_sample(const TerrainFieldPacket *packet, float x, float y, float z) {
+    float surface = packet->base.base_height + terrain_base_displacement(&packet->base, x, y, z);
+    for (uint32_t i = 0u; i < packet->feature_count && i < TERRAIN_MAX_ACTIVE_FEATURES; i += 1u) {
+        surface += terrain_feature_height_delta(&packet->features[i], x, surface, z);
     }
 
-    return y - config->base_height - displacement - peak_sum;
+    float sdf = y - surface;
+    const float p[3] = {x, y, z};
+    for (uint32_t i = 0u; i < packet->feature_count && i < TERRAIN_MAX_ACTIVE_FEATURES; i += 1u) {
+        const TerrainFeature *feature = &packet->features[i];
+        switch (feature->type) {
+            case TERRAIN_FEATURE_CAVE_SUBTRACT: {
+                const float ex = fmaxf(feature->extent[0], 1e-4f);
+                const float ey = fmaxf(feature->extent[1], 1e-4f);
+                const float ez = fmaxf(feature->extent[2], 1e-4f);
+                const float dx = (x - feature->position[0]) / ex;
+                const float dy = (y - feature->position[1]) / ey;
+                const float dz = (z - feature->position[2]) / ez;
+                const float shape = (sqrtf(dx * dx + dy * dy + dz * dz) - 1.0f) * fminf(fminf(ex, ey), ez);
+                sdf = fmaxf(sdf, -shape);
+                break;
+            }
+            case TERRAIN_FEATURE_BOX_SOLID:
+                sdf = fminf(sdf, terrain_signed_box(p, feature));
+                break;
+            case TERRAIN_FEATURE_BOX_CUT:
+            case TERRAIN_FEATURE_CLIFF_CUT:
+                sdf = fmaxf(sdf, -terrain_signed_box(p, feature));
+                break;
+            case TERRAIN_FEATURE_CYLINDER_SOLID:
+                sdf = fminf(sdf, terrain_signed_cylinder_y(p, feature));
+                break;
+            default:
+                break;
+        }
+    }
+    return sdf;
+}
+
+float
+terrain_density_sample(const TerrainRegionConfig *config, float x, float y, float z) {
+    const TerrainFieldPacket packet = terrain_field_packet_from_config(config);
+    return terrain_field_density_sample(&packet, x, y, z);
+}
+
+void
+terrain_world_init(TerrainWorld *world, const TerrainRegionConfig *base) {
+    *world = (TerrainWorld) {
+        .base = base != NULL ? *base : terrain_default_region_config(),
+        .feature_count = 0u,
+    };
+}
+
+bool
+terrain_world_add_feature(TerrainWorld *world, TerrainFeature feature) {
+    if (world->feature_count >= TERRAIN_MAX_WORLD_FEATURES) {
+        return false;
+    }
+    if (feature.region_id == UINT32_MAX) {
+        feature.region_id = 0u;
+    }
+    if (feature.direction[0] == 0.0f && feature.direction[1] == 0.0f && feature.direction[2] == 0.0f) {
+        feature.direction[0] = 1.0f;
+    }
+    world->features[world->feature_count++] = feature;
+    return true;
+}
+
+void
+terrain_world_add_demo_features(TerrainWorld *world, float center_x, float center_z) {
+    (void)terrain_world_add_feature(world, (TerrainFeature) {
+        .type = TERRAIN_FEATURE_PEAK,
+        .region_id = 0u,
+        .position = {center_x, 0.0f, center_z},
+        .direction = {1.0f, 0.0f, 0.0f},
+        .intensity = 24.0f,
+        .sharpness = 0.12f,
+        .min_lod = UINT32_MAX,
+    });
+    (void)terrain_world_add_feature(world, (TerrainFeature) {
+        .type = TERRAIN_FEATURE_PEAK,
+        .region_id = 0u,
+        .position = {center_x + 45.0f, 0.0f, center_z - 25.0f},
+        .direction = {1.0f, 0.0f, 0.0f},
+        .intensity = 16.0f,
+        .sharpness = 0.20f,
+        .min_lod = UINT32_MAX,
+    });
+    (void)terrain_world_add_feature(world, (TerrainFeature) {
+        .type = TERRAIN_FEATURE_PEAK,
+        .region_id = 0u,
+        .position = {center_x - 40.0f, 0.0f, center_z + 20.0f},
+        .direction = {1.0f, 0.0f, 0.0f},
+        .intensity = 12.0f,
+        .sharpness = 0.35f,
+        .min_lod = UINT32_MAX,
+    });
+}
+
+static bool
+terrain_feature_overlaps_xz(const TerrainFeature *feature, float min_x, float min_z, float max_x, float max_z) {
+    const float radius = terrain_feature_radius(feature);
+    const float x = feature->position[0];
+    const float z = feature->position[2];
+    const float nearest_x = fminf(fmaxf(x, min_x), max_x);
+    const float nearest_z = fminf(fmaxf(z, min_z), max_z);
+    const float dx = x - nearest_x;
+    const float dz = z - nearest_z;
+    return dx * dx + dz * dz <= radius * radius;
+}
+
+bool
+terrain_world_build_packet(
+    const TerrainWorld *world,
+    uint32_t region_id,
+    float min_x,
+    float min_z,
+    float max_x,
+    float max_z,
+    TerrainFieldPacket *out_packet
+) {
+    TerrainFieldPacket packet = {
+        .base = world->base,
+        .region_id = region_id,
+        .feature_count = 0u,
+        .overflow_count = 0u,
+        .min_lod = UINT32_MAX,
+    };
+    packet.base.peak_count = 0u;
+
+    for (uint32_t i = 0u; i < world->feature_count; i += 1u) {
+        const TerrainFeature *feature = &world->features[i];
+        if (feature->region_id != region_id || !terrain_feature_overlaps_xz(feature, min_x, min_z, max_x, max_z)) {
+            continue;
+        }
+        if (packet.feature_count >= TERRAIN_MAX_ACTIVE_FEATURES) {
+            packet.overflow_count += 1u;
+            continue;
+        }
+        packet.features[packet.feature_count++] = *feature;
+        if (feature->min_lod < packet.min_lod) {
+            packet.min_lod = feature->min_lod;
+        }
+    }
+
+    *out_packet = packet;
+    return packet.overflow_count == 0u;
 }
