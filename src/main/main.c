@@ -856,6 +856,15 @@ ensure_depth_texture(AppState *state, uint32_t width, uint32_t height) {
 static bool
 initialize_terrain(AppState *state) {
     state->terrain_config = terrain_default_region_config();
+    /* Demo peaks clustered around the region centre, where the camera starts
+     * and looks (see reset_camera), so the feature is visible on launch:
+     * a broad tall mountain, a steeper mid peak, and a narrow spike. */
+    const float cx = chunk_region_extent() * 0.5f;
+    const float cz = chunk_region_extent() * 0.5f;
+    state->terrain_config.peak_count = 3u;
+    state->terrain_config.peaks[0] = (TerrainPeak){.pos_x = cx,         .pos_z = cz,         .intensity = 24.0f, .sharpness = 0.12f};
+    state->terrain_config.peaks[1] = (TerrainPeak){.pos_x = cx + 45.0f, .pos_z = cz - 25.0f, .intensity = 16.0f, .sharpness = 0.20f};
+    state->terrain_config.peaks[2] = (TerrainPeak){.pos_x = cx - 40.0f, .pos_z = cz + 20.0f, .intensity = 12.0f, .sharpness = 0.35f};
     state->density_version = terrain_density_hash(&state->terrain_config);
 
     state->pool_capacity = CHUNK_POOL_CAPACITY_DEFAULT;

@@ -21,6 +21,7 @@ terrain_default_region_config(void) {
         .noise_lacunarity = 2.05f,
         .noise_gain = 0.48f,
         .noise_octaves = 4u,
+        .peak_count = 0u,
     };
     terrain_region_apply_height_range(&config);
     return config;
@@ -38,8 +39,20 @@ terrain_region_apply_height_range(TerrainRegionConfig *config) {
 TerrainHeightBounds
 terrain_region_snap_height_bounds(const TerrainRegionConfig *config) {
     const float resolution = config->grid_resolution > 0.0f ? config->grid_resolution : 1.0f;
+
+    /* Peaks add height on top of the noise displacement, so the sampled volume
+     * must extend above max_height or the raised surface falls outside the
+     * generated cells and emits no mesh. Sum of intensities is a safe upper
+     * bound (each exponential falloff factor is <= 1, peaks may overlap). */
+    float peak_headroom = 0.0f;
+    for (uint32_t i = 0u; i < config->peak_count && i < TERRAIN_MAX_PEAKS; i += 1u) {
+        if (config->peaks[i].intensity > 0.0f) {
+            peak_headroom += config->peaks[i].intensity;
+        }
+    }
+
     const int32_t min_y = (int32_t)floorf(config->min_height / resolution);
-    const int32_t max_y = (int32_t)ceilf(config->max_height / resolution);
+    const int32_t max_y = (int32_t)ceilf((config->max_height + peak_headroom) / resolution);
 
     return (TerrainHeightBounds) {
         .min_y = min_y,
@@ -75,6 +88,17 @@ terrain_density_hash(const TerrainRegionConfig *config) {
     h = terrain_mix_f32(h, config->noise_lacunarity);
     h = terrain_mix_f32(h, config->noise_gain);
     h ^= terrain_hash_u32(config->noise_octaves + 0x0000abcdu);
+
+    /* Fold in every peak field so edits invalidate cached chunks and reverts
+     * reuse them exactly. */
+    h ^= terrain_hash_u32(config->peak_count + 0x0000fee1u);
+    for (uint32_t i = 0u; i < config->peak_count && i < TERRAIN_MAX_PEAKS; i += 1u) {
+        const TerrainPeak *peak = &config->peaks[i];
+        h = terrain_mix_f32(h, peak->pos_x);
+        h = terrain_mix_f32(h, peak->pos_z);
+        h = terrain_mix_f32(h, peak->intensity);
+        h = terrain_mix_f32(h, peak->sharpness);
+    }
     return terrain_hash_u32(h);
 }
 
@@ -185,5 +209,19 @@ terrain_density_sample(const TerrainRegionConfig *config, float x, float y, floa
     const float ridge = (1.0f - fabsf(terrain_fbm3(config, wx + 53.0f, wy * 0.7f, wz - 29.0f))) * 2.0f - 1.0f;
     const float displacement = config->noise_amplitude * (broad * 0.55f + detail * 0.30f + ridge * 0.15f);
 
-    return y - config->base_height - displacement;
+    /* Peaks add height (subtract from the SDF) with exponential falloff in the
+     * un-warped XZ plane, so each peak sits exactly at its defined position. */
+    float peak_sum = 0.0f;
+    for (uint32_t i = 0u; i < config->peak_count && i < TERRAIN_MAX_PEAKS; i += 1u) {
+        const TerrainPeak *peak = &config->peaks[i];
+        const float dist = hypotf(x - peak->pos_x, z - peak->pos_z);
+        /* Round the apex over a radius proportional to the peak width
+         * (1/sharpness) so the tip is smooth rather than a sharp cone point,
+         * while the exponential flanks are preserved. */
+        const float round_r = 0.5f / fmaxf(peak->sharpness, 1e-4f);
+        const float soft = sqrtf(dist * dist + round_r * round_r) - round_r;
+        peak_sum += peak->intensity * expf(-peak->sharpness * soft);
+    }
+
+    return y - config->base_height - displacement - peak_sum;
 }

@@ -11,9 +11,10 @@ typedef struct TerrainGpuParams {
     float noise[4];      /* cell_size, noise_freq, noise_amp, base_height */
     float field[4];      /* warp_amount, warp_freq, lacunarity, gain */
     float chunk[4];      /* origin_x, origin_y, origin_z, skirt_depth */
-    int32_t lmin[4];     /* local_min_x, local_min_z, region_id, _ */
+    int32_t lmin[4];     /* local_min_x, local_min_z, region_id, peak_count */
     int32_t omin[4];     /* owned_min_x, owned_min_y, owned_min_z, _ */
     int32_t odim[4];     /* owned_dim_x, owned_dim_y, owned_dim_z, _ */
+    float peaks[TERRAIN_MAX_PEAKS][4]; /* pos_x, pos_z, intensity, sharpness */
 } TerrainGpuParams;
 
 typedef struct CellSamplesGpu {
@@ -85,7 +86,10 @@ create_buffer(SDL_GPUDevice *device, SDL_GPUBufferUsageFlags usage, uint32_t siz
 static TerrainGpuParams
 make_params(const TerrainGpuPipeline *pipeline) {
     const ChunkLayout *layout = &pipeline->layout;
-    return (TerrainGpuParams) {
+    const uint32_t peak_count = pipeline->config.peak_count < TERRAIN_MAX_PEAKS
+        ? pipeline->config.peak_count
+        : TERRAIN_MAX_PEAKS;
+    TerrainGpuParams params = {
         .counts = {
             pipeline->cell_count,
             (uint32_t)layout->array_dim_x,
@@ -121,7 +125,7 @@ make_params(const TerrainGpuPipeline *pipeline) {
         },
         /* region_id is fixed to the single test region today; the future region
          * graph will supply per-chunk ids so regions can pick distinct materials. */
-        .lmin = {layout->local_min_x, layout->local_min_z, (int32_t)CHUNK_REGION_TEST, 0},
+        .lmin = {layout->local_min_x, layout->local_min_z, (int32_t)CHUNK_REGION_TEST, (int32_t)peak_count},
         .omin = {
             layout->owned_min_x,
             layout->owned_min_y,
@@ -130,6 +134,14 @@ make_params(const TerrainGpuPipeline *pipeline) {
         },
         .odim = {layout->owned_dim_x, layout->owned_dim_y, layout->owned_dim_z, 0},
     };
+    for (uint32_t i = 0u; i < peak_count; i += 1u) {
+        const TerrainPeak *peak = &pipeline->config.peaks[i];
+        params.peaks[i][0] = peak->pos_x;
+        params.peaks[i][1] = peak->pos_z;
+        params.peaks[i][2] = peak->intensity;
+        params.peaks[i][3] = peak->sharpness;
+    }
+    return params;
 }
 
 static bool

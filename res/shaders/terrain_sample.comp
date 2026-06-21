@@ -8,9 +8,10 @@ layout(std140, set = 2, binding = 0) uniform TerrainParams {
     vec4 noise;    // cell_size, noise_freq, noise_amp, base_height
     vec4 field;    // warp_amount, warp_freq, lacunarity, gain
     vec4 chunk;    // origin_x, origin_y, origin_z, skirt_depth
-    ivec4 lmin;    // local_min_x, local_min_z, _, _
+    ivec4 lmin;    // local_min_x, local_min_z, region_id, peak_count
     ivec4 omin;    // owned_min_x, owned_min_y, owned_min_z, _
     ivec4 odim;    // owned_dim_x, owned_dim_y, owned_dim_z, _
+    vec4 peaks[16]; // pos_x, pos_z, intensity, sharpness
 } params;
 
 layout(std430, set = 0, binding = 0) readonly buffer GridCoords {
@@ -97,7 +98,21 @@ float sample_sdf(vec3 p) {
     float ridge = (1.0 - abs(fbm3(q * vec3(1.0, 0.7, 1.0) + vec3(53.0, 0.0, -29.0)))) * 2.0 - 1.0;
     float displacement = params.noise.z * (broad * 0.55 + detail * 0.30 + ridge * 0.15);
 
-    return p.y - params.noise.w - displacement;
+    // Peaks add height (subtract from the SDF) with exponential falloff in the
+    // un-warped XZ plane, so each peak sits exactly at its defined position.
+    float peak_sum = 0.0;
+    uint peak_count = uint(params.lmin.w);
+    for (uint i = 0u; i < peak_count; i += 1u) {
+        float dist = length(p.xz - params.peaks[i].xy);
+        // Round the apex over a radius proportional to the peak width
+        // (1/sharpness) so the tip is smooth rather than a sharp cone point,
+        // while the exponential flanks are preserved.
+        float round_r = 0.5 / max(params.peaks[i].w, 1e-4);
+        float soft = sqrt(dist * dist + round_r * round_r) - round_r;
+        peak_sum += params.peaks[i].z * exp(-params.peaks[i].w * soft);
+    }
+
+    return p.y - params.noise.w - displacement - peak_sum;
 }
 
 vec3 corner_position(ivec3 coord, uint corner) {
