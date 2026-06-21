@@ -5,10 +5,14 @@
 #include "log.h"
 
 typedef struct TerrainGpuParams {
-    uint32_t counts[4];
-    int32_t bounds[4];
-    float noise[4];
-    float field[4];
+    uint32_t counts[4];  /* cell_count, array_dim_x, array_dim_z, max_vertices */
+    int32_t bounds[4];   /* local_min_y, array_dim_y, seed, octaves */
+    float noise[4];      /* cell_size, noise_freq, noise_amp, base_height */
+    float field[4];      /* warp_amount, warp_freq, lacunarity, gain */
+    float chunk[4];      /* origin_x, origin_y, origin_z, skirt_depth */
+    int32_t lmin[4];     /* local_min_x, local_min_z, _, _ */
+    int32_t omin[4];     /* owned_min_x, owned_min_y, owned_min_z, _ */
+    int32_t odim[4];     /* owned_dim_x, owned_dim_y, owned_dim_z, _ */
 } TerrainGpuParams;
 
 typedef struct CellSamplesGpu {
@@ -79,21 +83,22 @@ create_buffer(SDL_GPUDevice *device, SDL_GPUBufferUsageFlags usage, uint32_t siz
 
 static TerrainGpuParams
 make_params(const TerrainGpuPipeline *pipeline) {
+    const ChunkLayout *layout = &pipeline->layout;
     return (TerrainGpuParams) {
         .counts = {
             pipeline->cell_count,
-            pipeline->config.size_x,
-            pipeline->config.size_z,
+            (uint32_t)layout->array_dim_x,
+            (uint32_t)layout->array_dim_z,
             pipeline->max_vertices,
         },
         .bounds = {
-            terrain_region_snap_height_bounds(&pipeline->config).min_y,
-            terrain_region_snap_height_bounds(&pipeline->config).max_y,
+            layout->local_min_y,
+            layout->array_dim_y,
             (int32_t)pipeline->config.seed,
             (int32_t)pipeline->config.noise_octaves,
         },
         .noise = {
-            pipeline->config.grid_resolution,
+            layout->cell_size,
             pipeline->config.noise_frequency,
             pipeline->config.noise_amplitude,
             pipeline->config.base_height,
@@ -104,6 +109,17 @@ make_params(const TerrainGpuPipeline *pipeline) {
             pipeline->config.noise_lacunarity,
             pipeline->config.noise_gain,
         },
+        .chunk = {
+            layout->origin_x,
+            layout->origin_y,
+            layout->origin_z,
+            /* Skirt depth scales with cell size so it spans the vertical mismatch
+             * at a one-LOD transition (the coarser neighbour's cells are 2x). */
+            layout->cell_size * 4.0f,
+        },
+        .lmin = {layout->local_min_x, layout->local_min_z, 0, 0},
+        .omin = {layout->owned_min_x, layout->owned_min_y, layout->owned_min_z, 0},
+        .odim = {layout->owned_dim_x, layout->owned_dim_y, layout->owned_dim_z, 0},
     };
 }
 
@@ -149,11 +165,16 @@ upload_grid_coords(SDL_GPUDevice *device, const SparseGrid *grid, TerrainGpuPipe
 }
 
 bool
-terrain_gpu_init(SDL_GPUDevice *device, const TerrainRegionConfig *config, const SparseGrid *grid, TerrainGpuPipeline *pipeline) {
+terrain_gpu_init(SDL_GPUDevice *device, const TerrainRegionConfig *config, const SparseGrid *grid, const ChunkLayout *layout, TerrainGpuPipeline *pipeline) {
     *pipeline = (TerrainGpuPipeline) {0};
     pipeline->config = *config;
+    pipeline->layout = *layout;
     pipeline->cell_count = (uint32_t)grid->count;
-    pipeline->max_vertices = pipeline->cell_count * 6u;
+    /* Budget vertices by owned surface area with headroom for a few stacked
+     * surface layers (overhangs). The mesh shader guards against overflow, so a
+     * tight bound only risks dropping triangles in pathologically noisy cells. */
+    const uint32_t owned_area = (uint32_t)(layout->owned_dim_x * layout->owned_dim_z);
+    pipeline->max_vertices = owned_area > 0u ? owned_area * 72u : 6u;
 
     pipeline->sample_pipeline = create_compute_pipeline(
         device,
@@ -227,6 +248,21 @@ terrain_gpu_init(SDL_GPUDevice *device, const TerrainRegionConfig *config, const
         pipeline->cell_count,
         pipeline->max_vertices
     );
+    return true;
+}
+
+bool
+terrain_gpu_reuse(TerrainGpuPipeline *pipeline, const TerrainRegionConfig *config, const ChunkLayout *layout, uint32_t cell_count) {
+    if (pipeline->sample_pipeline == NULL || pipeline->cell_count != cell_count) {
+        return false;
+    }
+    /* The uploaded local coordinates are identical for a given LOD, so buffers
+     * are reused; the per-chunk origin AND the density parameters still differ,
+     * so both must be refreshed or a reused slot would sample with stale params. */
+    pipeline->config = *config;
+    pipeline->layout = *layout;
+    const uint32_t owned_area = (uint32_t)(layout->owned_dim_x * layout->owned_dim_z);
+    pipeline->max_vertices = owned_area > 0u ? owned_area * 72u : 6u;
     return true;
 }
 

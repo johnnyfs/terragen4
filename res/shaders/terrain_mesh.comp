@@ -3,10 +3,14 @@
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(std140, set = 2, binding = 0) uniform TerrainParams {
-    uvec4 counts;
-    ivec4 bounds;
-    vec4 noise;
-    vec4 field;
+    uvec4 counts;  // cell_count, array_dim_x, array_dim_z, max_vertices
+    ivec4 bounds;  // local_min_y, array_dim_y, seed, octaves
+    vec4 noise;    // cell_size, noise_freq, noise_amp, base_height
+    vec4 field;    // warp_amount, warp_freq, lacunarity, gain
+    vec4 chunk;    // origin_x, origin_y, origin_z, skirt_depth
+    ivec4 lmin;    // local_min_x, local_min_z, _, _
+    ivec4 omin;    // owned_min_x, owned_min_y, owned_min_z, _
+    ivec4 odim;    // owned_dim_x, owned_dim_y, owned_dim_z, _
 } params;
 
 struct CellSamples {
@@ -55,14 +59,31 @@ float sample_at(CellSamples cell, uint index) {
 }
 
 int cell_index(int x, int y, int z) {
-    int height_count = params.bounds.y - params.bounds.x;
-    if (x < 0 || x >= int(params.counts.y) || z < 0 || z >= int(params.counts.z)) {
+    int ax = int(params.counts.y);
+    int ay = params.bounds.y;
+    int az = int(params.counts.z);
+    int lmx = params.lmin.x;
+    int lmy = params.bounds.x;
+    int lmz = params.lmin.y;
+    if (ax <= 0 || ay <= 0 || az <= 0) {
         return -1;
     }
-    if (y < params.bounds.x || y >= params.bounds.y || height_count <= 0) {
+    if (x < lmx || x >= lmx + ax) {
         return -1;
     }
-    return z * height_count * int(params.counts.y) + (y - params.bounds.x) * int(params.counts.y) + x;
+    if (y < lmy || y >= lmy + ay) {
+        return -1;
+    }
+    if (z < lmz || z >= lmz + az) {
+        return -1;
+    }
+    return (z - lmz) * ay * ax + (y - lmy) * ax + (x - lmx);
+}
+
+bool cell_is_owned(ivec3 c) {
+    return c.x >= params.omin.x && c.x < params.omin.x + params.odim.x &&
+           c.y >= params.omin.y && c.y < params.omin.y + params.odim.y &&
+           c.z >= params.omin.z && c.z < params.omin.z + params.odim.z;
 }
 
 vec4 terrain_color(float y, vec3 normal) {
@@ -80,12 +101,9 @@ MeshVertex make_vertex(HermiteCell cell) {
     vec3 p = cell.position.xyz;
     vec3 n = normalize(cell.normal_crossings.xyz);
     MeshVertex v;
-    v.position = vec4(
-        p.x - float(params.counts.y) * params.noise.x * 0.5,
-        p.y,
-        p.z - float(params.counts.z) * params.noise.x * 0.5,
-        1.0
-    );
+    /* Hermite positions are already absolute world coordinates (corner_position
+     * adds the chunk origin), so no centering offset is applied here. */
+    v.position = vec4(p.x, p.y, p.z, 1.0);
     v.normal = vec4(n, 0.0);
     v.color = terrain_color(p.y, n);
     return v;
@@ -125,6 +143,61 @@ void emit_quad(HermiteCell c0, HermiteCell c1, HermiteCell c2, HermiteCell c3, b
         vertex_buffer.vertices[base + 3u] = v0;
         vertex_buffer.vertices[base + 4u] = v3;
         vertex_buffer.vertices[base + 5u] = v2;
+    }
+}
+
+/*
+ * Emit a vertical skirt segment hanging below a border surface vertex. Same-LOD
+ * seams are already crack-free (shared halo sampling); skirts only need to hide
+ * the thin vertical gaps where neighbouring chunks differ by one LOD. The
+ * curtain spans one cell width along the border tangent and drops skirt_depth.
+ */
+void emit_skirt(vec3 p, vec3 n, vec4 color, vec3 tangent, float half_width, float depth) {
+    uint base = atomicAdd(draw_buffer.draw_args.num_vertices, 6u);
+    if (base + 6u > params.counts.w) {
+        return;
+    }
+    vec3 t = tangent * half_width;
+    vec3 d = vec3(0.0, depth, 0.0);
+    vec3 a = p - t;
+    vec3 b = p + t;
+
+    MeshVertex va; va.position = vec4(a, 1.0);     va.normal = vec4(n, 0.0); va.color = color;
+    MeshVertex vb; vb.position = vec4(b, 1.0);     vb.normal = vec4(n, 0.0); vb.color = color;
+    MeshVertex vc; vc.position = vec4(b - d, 1.0); vc.normal = vec4(n, 0.0); vc.color = color;
+    MeshVertex vd; vd.position = vec4(a - d, 1.0); vd.normal = vec4(n, 0.0); vd.color = color;
+
+    vertex_buffer.vertices[base + 0u] = va;
+    vertex_buffer.vertices[base + 1u] = vb;
+    vertex_buffer.vertices[base + 2u] = vc;
+    vertex_buffer.vertices[base + 3u] = va;
+    vertex_buffer.vertices[base + 4u] = vc;
+    vertex_buffer.vertices[base + 5u] = vd;
+}
+
+void emit_border_skirts(ivec3 c) {
+    float depth = params.chunk.w;
+    if (depth <= 0.0) {
+        return;
+    }
+    bool bx = (c.x == params.omin.x) || (c.x == params.omin.x + params.odim.x - 1);
+    bool bz = (c.z == params.omin.z) || (c.z == params.omin.z + params.odim.z - 1);
+    if (!bx && !bz) {
+        return;
+    }
+    HermiteCell self;
+    if (!load_cell(c.x, c.y, c.z, self)) {
+        return;
+    }
+    vec3 p = self.position.xyz;
+    vec3 n = normalize(self.normal_crossings.xyz);
+    vec4 color = terrain_color(p.y, n);
+    float half_width = params.noise.x * 0.5;
+    if (bx) {
+        emit_skirt(p, n, color, vec3(0.0, 0.0, 1.0), half_width, depth);
+    }
+    if (bz) {
+        emit_skirt(p, n, color, vec3(1.0, 0.0, 0.0), half_width, depth);
     }
 }
 
@@ -189,6 +262,12 @@ void main() {
         CellSamples sample_cell = sample_buffer.samples[i];
         ivec3 c = sample_cell.coord.xyz;
 
+        /* Halo cells provide neighbour data only; they never emit geometry, so
+         * each boundary quad is produced exactly once across adjacent chunks. */
+        if (!cell_is_owned(c)) {
+            continue;
+        }
+
         float s0 = sample_at(sample_cell, 0u);
         float sx = sample_at(sample_cell, 1u);
         float sy = sample_at(sample_cell, 4u);
@@ -203,5 +282,7 @@ void main() {
         if ((s0 < 0.0 && sz >= 0.0) || (s0 >= 0.0 && sz < 0.0)) {
             emit_z_edge(c, s0 < sz);
         }
+
+        emit_border_skirts(c);
     }
 }

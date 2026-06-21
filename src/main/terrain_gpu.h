@@ -17,6 +17,7 @@ typedef struct TerrainMeshVertex {
 
 typedef struct TerrainGpuPipeline {
     TerrainRegionConfig config;
+    ChunkLayout layout;
     uint32_t cell_count;
     uint32_t max_vertices;
 
@@ -36,8 +37,18 @@ bool terrain_gpu_init(
     SDL_GPUDevice *device,
     const TerrainRegionConfig *config,
     const SparseGrid *grid,
+    const ChunkLayout *layout,
     TerrainGpuPipeline *pipeline
 );
+/*
+ * Repoint an already-initialised pipeline at a different chunk without
+ * reallocating buffers or re-uploading coordinates. Valid only when the new
+ * layout has the same cell_count (same LOD) as the pipeline was built with:
+ * all chunks at a given LOD share identical local coordinates, so only the
+ * per-chunk origin (a uniform) differs. Returns false if sizes mismatch.
+ */
+bool terrain_gpu_reuse(TerrainGpuPipeline *pipeline, const TerrainRegionConfig *config, const ChunkLayout *layout, uint32_t cell_count);
+
 void terrain_gpu_generate(SDL_GPUCommandBuffer *command_buffer, TerrainGpuPipeline *pipeline);
 void terrain_gpu_render(SDL_GPURenderPass *render_pass, TerrainGpuPipeline *pipeline);
 void terrain_gpu_destroy(SDL_GPUDevice *device, TerrainGpuPipeline *pipeline);

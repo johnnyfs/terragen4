@@ -5,6 +5,8 @@
 
 #include <log.h>
 
+#include "chunk_cache.h"
+#include "chunk_coord.h"
 #include "sparse_grid.h"
 #include "terrain_config.h"
 #include "terrain_gpu.h"
@@ -27,9 +29,35 @@ typedef struct HudVertex {
 } HudVertex;
 
 #define HUD_MAX_VERTICES 49152u
-#define TERRAIN_WORLD_SIZE 64.0f
-#define TERRAIN_MIN_DETAIL 16u
-#define TERRAIN_MAX_DETAIL 128u
+
+/* Chunk system runtime budget (tunable). Resident memory ~= pool capacity x
+ * per-chunk buffers, so the pool caps how many chunks stay live at once. The
+ * default can be overridden at runtime via TERRAGEN_POOL. */
+#define CHUNK_POOL_CAPACITY_DEFAULT 256u
+#define CHUNK_MAX_GEN_PER_FRAME 6u
+#define CHUNK_MAX_ACTIVE 4096u
+
+/* Camera modes the user TABs through. FREE is the original free-look camera. */
+typedef enum {
+    CAM_FREE = 0,
+    CAM_FLIGHT,
+    CAM_GROUND,
+    CAM_MODE_COUNT,
+} CameraMode;
+
+/* Camera feel knobs (world units, seconds, radians). */
+#define CAM_EYE_HEIGHT 1.8f      /* GROUND: camera height above the surface */
+#define CAM_GRAVITY 22.0f        /* GROUND: downward accel */
+#define CAM_JUMP_SPEED 9.0f      /* GROUND: upward impulse per SPACE press */
+#define CAM_GROUND_SPEED 24.0f   /* GROUND: walk speed (matches FREE strafe) */
+#define CAM_GROUND_TURN 1.8f     /* GROUND: A/D yaw turn rate */
+#define CAM_FLIGHT_ACCEL 60.0f   /* FLIGHT: throttle accel from W/S */
+#define CAM_FLIGHT_SPEED_MIN -30.0f
+#define CAM_FLIGHT_SPEED_MAX 140.0f
+#define CAM_FLIGHT_TURN 1.6f     /* FLIGHT: A/D yaw turn rate */
+#define CAM_FLIGHT_PITCH 1.4f    /* FLIGHT: up/down pitch rate */
+#define CAM_FLIGHT_ROLL 2.0f     /* FLIGHT: left/right bank rate */
+#define CAM_FLIGHT_ROLL_MAX 1.2f
 
 typedef struct AppState {
     SDL_Window *window;
@@ -44,19 +72,45 @@ typedef struct AppState {
     uint32_t hud_vertex_count;
 
     TerrainRegionConfig terrain_config;
-    SparseGrid sparse_grid;
-    TerrainGpuPipeline terrain;
+
+    /* Chunk system: a pool of GPU pipelines indexed by cache record slots. */
+    ChunkCache chunk_cache;
+    TerrainGpuPipeline *chunk_pool;
+    uint32_t pool_capacity;
+    uint32_t density_version;
+    ChunkGenKey active_keys[CHUNK_MAX_ACTIVE];
+    size_t active_count;
+
+    /* Debug counters, refreshed each frame. */
+    uint32_t dbg_active;
+    uint32_t dbg_rendered;
+    uint32_t dbg_hits;
+    uint32_t dbg_misses;
+    uint32_t dbg_evictions;
+    uint32_t dbg_generated;
+    uint32_t dbg_failed;
+    uint32_t dbg_resident;
+    uint32_t dbg_queue;
+    uint32_t dbg_evictions_total;
+    uint32_t dbg_generated_total;
+    uint32_t dbg_lod[CHUNK_LOD_COUNT];
+
     uint32_t frame_count;
     uint32_t smoke_frame_limit;
+    float smoke_drift;
     uint64_t last_frame_ticks;
     float fps;
     float last_regen_ms;
-    uint32_t terrain_detail;
 
     float camera_position[3];
     float camera_yaw;
     float camera_pitch;
     float camera_fov_degrees;
+
+    CameraMode camera_mode;
+    float camera_roll;    /* banking, radians (FLIGHT only; 0 otherwise) */
+    float flight_speed;   /* FLIGHT throttle / forward velocity along facing */
+    float velocity_y;     /* GROUND vertical velocity (gravity + jumps) */
 } AppState;
 
 static SDL_GPUShader *
@@ -145,7 +199,7 @@ mat4_perspective(float fovy_radians, float aspect, float near_z, float far_z, fl
     const float f = 1.0f / tanf(fovy_radians * 0.5f);
     SDL_memset(out, 0, sizeof(float) * 16u);
     out[0] = f / aspect;
-    out[5] = -f;
+    out[5] = f;
     out[10] = far_z / (near_z - far_z);
     out[11] = -1.0f;
     out[14] = (near_z * far_z) / (near_z - far_z);
@@ -198,7 +252,24 @@ make_camera_uniform(const AppState *state, uint32_t width, uint32_t height) {
         state->camera_position[1] + forward[1],
         state->camera_position[2] + forward[2],
     };
-    const float up[3] = {0.0f, 1.0f, 0.0f};
+
+    /* Up vector banked by camera_roll about the forward axis. With roll == 0 this
+     * reduces to world-up (0,1,0), so FREE/GROUND are unaffected. */
+    float up[3] = {0.0f, 1.0f, 0.0f};
+    float world_up[3] = {0.0f, 1.0f, 0.0f};
+    float right[3] = {0};
+    vec3_cross(forward, world_up, right);
+    if (vec3_dot(right, right) > 0.000001f) {
+        vec3_normalize(right);
+        float level_up[3] = {0};
+        vec3_cross(right, forward, level_up);
+        const float cr = cosf(state->camera_roll);
+        const float sr = sinf(state->camera_roll);
+        up[0] = level_up[0] * cr + right[0] * sr;
+        up[1] = level_up[1] * cr + right[1] * sr;
+        up[2] = level_up[2] * cr + right[2] * sr;
+    }
+
     float projection[16] = {0};
     float view[16] = {0};
     CameraUniform camera = {0};
@@ -473,6 +544,14 @@ glyph_row(char c, int row) {
         case '.': return row == 6 ? 0x04u : 0x00u;
         case ':': return (row == 2 || row == 5) ? 0x04u : 0x00u;
         case 'X': return letters['X' - 'A'][row];
+        case '[': {
+            static const uint8_t lb[7] = {0x0eu, 0x08u, 0x08u, 0x08u, 0x08u, 0x08u, 0x0eu};
+            return lb[row];
+        }
+        case ']': {
+            static const uint8_t rb[7] = {0x0eu, 0x02u, 0x02u, 0x02u, 0x02u, 0x02u, 0x0eu};
+            return rb[row];
+        }
         default: return 0x00u;
     }
 }
@@ -540,26 +619,60 @@ build_and_upload_hud(AppState *state, SDL_GPUCommandBuffer *command_buffer) {
     hud_emit_text(vertices, &count, x, y, scale, line);
     y += line_step;
 
+    const char *mode_name =
+        state->camera_mode == CAM_FLIGHT ? "FLIGHT" :
+        state->camera_mode == CAM_GROUND ? "GROUND" : "FREE";
+    if (state->camera_mode == CAM_FLIGHT) {
+        SDL_snprintf(line, sizeof(line), "MODE %s  SPEED %.0f  [TAB]", mode_name, state->flight_speed);
+    } else {
+        SDL_snprintf(line, sizeof(line), "MODE %s  [TAB]", mode_name);
+    }
+    hud_emit_text(vertices, &count, x, y, scale, line);
+    y += line_step;
+
     SDL_snprintf(
         line,
         sizeof(line),
-        "HEIGHT %.1f / %.1f",
+        "J/K HEIGHT %.1f / %.1f",
         state->terrain_config.min_height,
         state->terrain_config.max_height
     );
     hud_emit_text(vertices, &count, x, y, scale, line);
     y += line_step;
 
-    SDL_snprintf(line, sizeof(line), "REGEN %.2f MS", state->last_regen_ms);
+    SDL_snprintf(
+        line,
+        sizeof(line),
+        "CHUNKS A%u R%u  RES %u/%u",
+        state->dbg_active,
+        state->dbg_rendered,
+        state->dbg_resident,
+        (unsigned)state->pool_capacity
+    );
     hud_emit_text(vertices, &count, x, y, scale, line);
     y += line_step;
 
     SDL_snprintf(
         line,
         sizeof(line),
-        "DETAIL %uX%u",
-        state->terrain_config.size_x,
-        state->terrain_config.size_z
+        "LOD %u/%u/%u  Q%u",
+        state->dbg_lod[0],
+        CHUNK_LOD_COUNT > 1u ? state->dbg_lod[1] : 0u,
+        CHUNK_LOD_COUNT > 2u ? state->dbg_lod[2] : 0u,
+        state->dbg_queue
+    );
+    hud_emit_text(vertices, &count, x, y, scale, line);
+    y += line_step;
+
+    SDL_snprintf(
+        line,
+        sizeof(line),
+        "HIT%u MISS%u EV%u GEN%u F%u",
+        state->dbg_hits,
+        state->dbg_misses,
+        state->dbg_evictions,
+        state->dbg_generated,
+        state->dbg_failed
     );
     hud_emit_text(vertices, &count, x, y, scale, line);
     y += line_step;
@@ -575,20 +688,27 @@ build_and_upload_hud(AppState *state, SDL_GPUCommandBuffer *command_buffer) {
     hud_emit_text(vertices, &count, x, y, scale, line);
     y += line_step;
 
-    SDL_snprintf(line, sizeof(line), "ZOOM %.1f DEG", state->camera_fov_degrees);
+    SDL_snprintf(line, sizeof(line), "WHEEL ZOOM %.1f DEG", state->camera_fov_degrees);
     hud_emit_text(vertices, &count, x, y, scale, line);
     y += line_step;
 
-    SDL_snprintf(line, sizeof(line), "WARP %.1f", state->terrain_config.warp_amount);
+    SDL_snprintf(line, sizeof(line), "U/I WARP %.1f", state->terrain_config.warp_amount);
     hud_emit_text(vertices, &count, x, y, scale, line);
     y += line_step;
 
-    SDL_snprintf(line, sizeof(line), "FREQ %.3f", state->terrain_config.noise_frequency);
+    SDL_snprintf(line, sizeof(line), "N/M FREQ %.3f", state->terrain_config.noise_frequency);
     hud_emit_text(vertices, &count, x, y, scale, line);
     y += line_step;
 
-    SDL_snprintf(line, sizeof(line), "OCTAVES %u", state->terrain_config.noise_octaves);
+    SDL_snprintf(line, sizeof(line), "[/] OCTAVES %u", state->terrain_config.noise_octaves);
     hud_emit_text(vertices, &count, x, y, scale, line);
+    y += line_step;
+
+    const char *help =
+        state->camera_mode == CAM_FLIGHT ? "W/S THROTTLE  A/D TURN  ARROWS PITCH/ROLL  R RESET" :
+        state->camera_mode == CAM_GROUND ? "WASD MOVE/TURN  MOUSE LOOK  SPACE JUMP  R RESET" :
+        "WASD MOVE  MMB UP/DOWN  ESC MOUSE  R RESET";
+    hud_emit_text(vertices, &count, x, y, scale, help);
 
     SDL_UnmapGPUTransferBuffer(state->device, state->hud_transfer_buffer);
     state->hud_vertex_count = count;
@@ -661,67 +781,243 @@ ensure_depth_texture(AppState *state, uint32_t width, uint32_t height) {
 static bool
 initialize_terrain(AppState *state) {
     state->terrain_config = terrain_default_region_config();
-    state->terrain_detail = state->terrain_config.size_x;
-    if (!sparse_grid_create_dense(&state->sparse_grid, &state->terrain_config)) {
-        log_error("Could not create sparse terrain grid");
+    state->density_version = terrain_density_hash(&state->terrain_config);
+
+    state->pool_capacity = CHUNK_POOL_CAPACITY_DEFAULT;
+    const char *pool_env = getenv("TERRAGEN_POOL");
+    if (pool_env != NULL) {
+        const int requested = SDL_atoi(pool_env);
+        if (requested > 0) {
+            state->pool_capacity = (uint32_t)requested;
+        }
+    }
+
+    state->chunk_pool = calloc(state->pool_capacity, sizeof(*state->chunk_pool));
+    if (state->chunk_pool == NULL) {
+        log_error("Could not allocate chunk pipeline pool");
+        return false;
+    }
+    if (!chunk_cache_init(&state->chunk_cache, state->pool_capacity)) {
+        log_error("Could not initialise chunk cache");
         return false;
     }
 
-    if (!terrain_gpu_init(state->device, &state->terrain_config, &state->sparse_grid, &state->terrain)) {
-        return false;
-    }
-
-    SDL_GPUCommandBuffer *command_buffer = SDL_AcquireGPUCommandBuffer(state->device);
-    terrain_gpu_generate(command_buffer, &state->terrain);
-    SDL_SubmitGPUCommandBuffer(command_buffer);
+    log_info(
+        "Chunk world: %d x %d region, %u cells/chunk, pool %u",
+        (int)chunk_count_per_axis(0u),
+        (int)chunk_count_per_axis(0u),
+        (unsigned)CHUNK_CELLS,
+        (unsigned)state->pool_capacity
+    );
     return true;
 }
 
 static void
-configure_terrain_detail(AppState *state, uint32_t detail) {
-    if (detail < TERRAIN_MIN_DETAIL) {
-        detail = TERRAIN_MIN_DETAIL;
-    }
-    if (detail > TERRAIN_MAX_DETAIL) {
-        detail = TERRAIN_MAX_DETAIL;
-    }
-
-    state->terrain_detail = detail;
-    state->terrain_config.size_x = detail;
-    state->terrain_config.size_z = detail;
-    state->terrain_config.grid_resolution = TERRAIN_WORLD_SIZE / (float)detail;
-    terrain_region_apply_height_range(&state->terrain_config);
+chunk_key_center(ChunkGenKey key, float *out_x, float *out_z) {
+    const ChunkCoord c = {.cx = key.cx, .cz = key.cz, .lod = key.lod};
+    const ChunkAabb2 b = chunk_bounds(c);
+    *out_x = (b.min_x + b.max_x) * 0.5f;
+    *out_z = (b.min_z + b.max_z) * 0.5f;
 }
 
+/* Generate (or repoint+regenerate) the chunk for rec into its pool slot. */
 static bool
-regenerate_terrain(AppState *state) {
-    const uint64_t start = SDL_GetPerformanceCounter();
-    const uint64_t frequency = SDL_GetPerformanceFrequency();
+generate_chunk(AppState *state, SDL_GPUCommandBuffer *command_buffer, ChunkRecord *rec) {
+    const ChunkGenKey key = rec->key;
+    TerrainGpuPipeline *pipe = &state->chunk_pool[rec->slot];
+    const ChunkLayout layout = sparse_grid_chunk_layout(&state->terrain_config, key.lod, key.cx, key.cz);
+    const uint32_t cell_count =
+        (uint32_t)(layout.array_dim_x * layout.array_dim_y * layout.array_dim_z);
 
-    SDL_WaitForGPUIdle(state->device);
-    terrain_gpu_destroy(state->device, &state->terrain);
-    sparse_grid_destroy(&state->sparse_grid);
-
-    configure_terrain_detail(state, state->terrain_detail);
-    if (!sparse_grid_create_dense(&state->sparse_grid, &state->terrain_config)) {
-        log_error("Could not rebuild sparse terrain grid");
-        return false;
+    if (!terrain_gpu_reuse(pipe, &state->terrain_config, &layout, cell_count)) {
+        /* The slot held a different-sized chunk (or none): rebuild its buffers.
+         * Same-LOD reuse above keeps the common case allocation-free. */
+        if (pipe->sample_pipeline != NULL) {
+            terrain_gpu_destroy(state->device, pipe);
+        }
+        SparseGrid grid = {0};
+        if (!sparse_grid_create_chunk(&grid, &state->terrain_config, key.lod, key.cx, key.cz)) {
+            return false;
+        }
+        const bool ok = terrain_gpu_init(state->device, &state->terrain_config, &grid, &layout, pipe);
+        sparse_grid_destroy(&grid);
+        if (!ok) {
+            return false;
+        }
     }
-    if (!terrain_gpu_init(state->device, &state->terrain_config, &state->sparse_grid, &state->terrain)) {
-        return false;
-    }
 
-    SDL_GPUCommandBuffer *command_buffer = SDL_AcquireGPUCommandBuffer(state->device);
-    terrain_gpu_generate(command_buffer, &state->terrain);
-    SDL_SubmitGPUCommandBuffer(command_buffer);
-
-    const uint64_t end = SDL_GetPerformanceCounter();
-    state->last_regen_ms = (float)((double)(end - start) * 1000.0 / (double)frequency);
+    rec->mem_estimate =
+        (size_t)cell_count * (sizeof(SparseGridCoord) + 96u) +
+        (size_t)pipe->max_vertices * sizeof(TerrainMeshVertex);
+    terrain_gpu_generate(command_buffer, pipe);
     return true;
 }
 
+/*
+ * Per-frame chunk selection and generation. Computes the active set around the
+ * POV, reuses resident chunks, enqueues missing ones (evicting far/stale chunks
+ * when the pool is full), and generates up to a budget into a dedicated command
+ * buffer submitted before the frame's render pass.
+ */
 static void
-update_camera(AppState *state, float dt) {
+chunk_system_update(AppState *state) {
+    const float pov_x = state->camera_position[0];
+    const float pov_z = state->camera_position[2];
+
+    /* Content-addressed density version: identical params reuse cached chunks
+     * exactly (so reverting a setting heals instantly), any change invalidates. */
+    state->density_version = terrain_density_hash(&state->terrain_config);
+
+    state->active_count = chunk_active_set(
+        pov_x, pov_z, CHUNK_REGION_TEST,
+        state->density_version, 1u, 1u, state->active_keys, CHUNK_MAX_ACTIVE
+    );
+
+    state->dbg_active = (uint32_t)state->active_count;
+    state->dbg_hits = 0u;
+    state->dbg_misses = 0u;
+    state->dbg_evictions = 0u;
+    state->dbg_generated = 0u;
+    for (uint32_t l = 0u; l < CHUNK_LOD_COUNT; l += 1u) {
+        state->dbg_lod[l] = 0u;
+    }
+
+    for (size_t i = 0u; i < state->active_count; i += 1u) {
+        const ChunkGenKey key = state->active_keys[i];
+        if (key.lod < CHUNK_LOD_COUNT) {
+            state->dbg_lod[key.lod] += 1u;
+        }
+        ChunkRecord *rec = chunk_cache_find(&state->chunk_cache, &key);
+        if (rec != NULL) {
+            rec->last_used_frame = state->frame_count;
+            if (rec->status == CHUNK_STATUS_READY) {
+                state->dbg_hits += 1u;
+            }
+            continue;
+        }
+
+        state->dbg_misses += 1u;
+        if (chunk_cache_free_slots(&state->chunk_cache) == 0u) {
+            ChunkRecord *victim = chunk_cache_pick_eviction(
+                &state->chunk_cache, state->active_keys, state->active_count, pov_x, pov_z
+            );
+            if (victim != NULL) {
+                /* Keep the pool pipeline allocated; only the record is freed so
+                 * the slot's buffers can be reused by the next same-LOD chunk. */
+                chunk_cache_remove(&state->chunk_cache, &victim->key);
+                state->dbg_evictions += 1u;
+                state->dbg_evictions_total += 1u;
+            }
+        }
+
+        float cx = 0.0f;
+        float cz = 0.0f;
+        chunk_key_center(key, &cx, &cz);
+        rec = chunk_cache_insert(&state->chunk_cache, &key, cx, cz);
+        if (rec != NULL) {
+            rec->last_used_frame = state->frame_count;
+            chunk_queue_push_if_absent(&state->chunk_cache, &key);
+        }
+    }
+
+    if (chunk_queue_size(&state->chunk_cache) > 0u) {
+        SDL_GPUCommandBuffer *command_buffer = SDL_AcquireGPUCommandBuffer(state->device);
+        for (uint32_t n = 0u; n < CHUNK_MAX_GEN_PER_FRAME; n += 1u) {
+            ChunkGenKey key;
+            if (!chunk_queue_pop(&state->chunk_cache, &key)) {
+                break;
+            }
+            ChunkRecord *rec = chunk_cache_find(&state->chunk_cache, &key);
+            if (rec == NULL || rec->status != CHUNK_STATUS_QUEUED) {
+                continue; /* evicted or already handled before generation ran */
+            }
+            rec->status = CHUNK_STATUS_GENERATING;
+            if (generate_chunk(state, command_buffer, rec)) {
+                rec->status = CHUNK_STATUS_READY;
+                state->dbg_generated += 1u;
+                state->dbg_generated_total += 1u;
+            } else {
+                rec->status = CHUNK_STATUS_FAILED;
+                state->dbg_failed += 1u;
+            }
+        }
+        SDL_SubmitGPUCommandBuffer(command_buffer);
+    }
+
+    state->dbg_resident = (uint32_t)chunk_cache_resident(&state->chunk_cache);
+    state->dbg_queue = (uint32_t)chunk_queue_size(&state->chunk_cache);
+
+    /* Periodic console summary so headless/smoke runs surface the same data. */
+    if ((state->frame_count % 120u) == 0u) {
+        log_info(
+            "chunks active=%u rendered=%u L0/L1/L2=%u/%u/%u resident=%u/%u queue=%u "
+            "hit=%u miss=%u evict=%u gen=%u fail=%u | totals gen=%u evict=%u",
+            state->dbg_active, state->dbg_rendered,
+            state->dbg_lod[0], CHUNK_LOD_COUNT > 1u ? state->dbg_lod[1] : 0u,
+            CHUNK_LOD_COUNT > 2u ? state->dbg_lod[2] : 0u,
+            state->dbg_resident, (unsigned)state->pool_capacity, state->dbg_queue,
+            state->dbg_hits, state->dbg_misses, state->dbg_evictions,
+            state->dbg_generated, state->dbg_failed,
+            state->dbg_generated_total, state->dbg_evictions_total
+        );
+    }
+}
+
+static void
+chunk_system_render(AppState *state, SDL_GPURenderPass *render_pass) {
+    state->dbg_rendered = 0u;
+    for (size_t i = 0u; i < state->active_count; i += 1u) {
+        ChunkRecord *rec = chunk_cache_find(&state->chunk_cache, &state->active_keys[i]);
+        if (rec != NULL && rec->status == CHUNK_STATUS_READY) {
+            terrain_gpu_render(render_pass, &state->chunk_pool[rec->slot]);
+            state->dbg_rendered += 1u;
+        }
+    }
+}
+
+/* Find the terrain surface height at (x, z) by locating the SDF zero-crossing of
+ * terrain_density_sample (the same field the visible mesh is built from). The SDF
+ * is negative inside solid terrain and positive in air. No chunk data is required,
+ * so this works anywhere in the streamed region. */
+static float
+find_ground_y(const TerrainRegionConfig *cfg, float x, float z) {
+    float y_hi = cfg->max_height + 32.0f; /* expected to be air */
+    float y_lo = cfg->min_height - 32.0f; /* expected to be solid */
+    /* Guard the brackets in case the expected sign does not hold. */
+    if (terrain_density_sample(cfg, x, y_hi, z) <= 0.0f) {
+        return y_hi;
+    }
+    if (terrain_density_sample(cfg, x, y_lo, z) >= 0.0f) {
+        return y_lo;
+    }
+    for (int i = 0; i < 24; i += 1) {
+        const float mid = (y_hi + y_lo) * 0.5f;
+        if (terrain_density_sample(cfg, x, mid, z) > 0.0f) {
+            y_hi = mid; /* air */
+        } else {
+            y_lo = mid; /* solid */
+        }
+    }
+    return (y_hi + y_lo) * 0.5f;
+}
+
+/* Restore the camera to its starting pose and clear transient motion state. Shared
+ * by SDL_AppInit and the R key. */
+static void
+reset_camera(AppState *state) {
+    state->camera_position[0] = chunk_region_extent() * 0.5f;
+    state->camera_position[1] = 34.0f;
+    state->camera_position[2] = chunk_region_extent() * 0.5f - 78.0f;
+    state->camera_yaw = 0.0f;
+    state->camera_pitch = -0.24f;
+    state->camera_fov_degrees = 60.0f;
+    state->camera_roll = 0.0f;
+    state->flight_speed = 0.0f;
+    state->velocity_y = 0.0f;
+}
+
+static void
+update_camera_free(AppState *state, float dt) {
     int key_count = 0;
     const bool *keys = SDL_GetKeyboardState(&key_count);
     if (keys == NULL) {
@@ -763,6 +1059,126 @@ update_camera(AppState *state, float dt) {
         state->camera_position[0] += move[0] / len * speed * dt;
         state->camera_position[2] += move[2] / len * speed * dt;
     }
+
+    /* Headless verification: drift the POV so smoke runs exercise chunk
+     * load/unload/eviction without interactive input. */
+    if (state->smoke_drift != 0.0f) {
+        state->camera_position[0] += state->smoke_drift * dt;
+    }
+}
+
+/* FLIGHT: airplane-style camera. W/S throttle, A/D yaw turn, up/down pitch,
+ * left/right bank (roll). Moves along the full 3D facing direction. */
+static void
+update_camera_flight(AppState *state, float dt) {
+    int key_count = 0;
+    const bool *keys = SDL_GetKeyboardState(&key_count);
+    if (keys == NULL) {
+        return;
+    }
+
+    if (SDL_SCANCODE_W < key_count && keys[SDL_SCANCODE_W]) {
+        state->flight_speed += CAM_FLIGHT_ACCEL * dt;
+    }
+    if (SDL_SCANCODE_S < key_count && keys[SDL_SCANCODE_S]) {
+        state->flight_speed -= CAM_FLIGHT_ACCEL * dt;
+    }
+    state->flight_speed = clampf(state->flight_speed, CAM_FLIGHT_SPEED_MIN, CAM_FLIGHT_SPEED_MAX);
+
+    if (SDL_SCANCODE_A < key_count && keys[SDL_SCANCODE_A]) {
+        state->camera_yaw += CAM_FLIGHT_TURN * dt;
+    }
+    if (SDL_SCANCODE_D < key_count && keys[SDL_SCANCODE_D]) {
+        state->camera_yaw -= CAM_FLIGHT_TURN * dt;
+    }
+    if (SDL_SCANCODE_UP < key_count && keys[SDL_SCANCODE_UP]) {
+        state->camera_pitch += CAM_FLIGHT_PITCH * dt;
+    }
+    if (SDL_SCANCODE_DOWN < key_count && keys[SDL_SCANCODE_DOWN]) {
+        state->camera_pitch -= CAM_FLIGHT_PITCH * dt;
+    }
+    state->camera_pitch = clampf(state->camera_pitch, -1.48f, 1.48f);
+
+    if (SDL_SCANCODE_LEFT < key_count && keys[SDL_SCANCODE_LEFT]) {
+        state->camera_roll -= CAM_FLIGHT_ROLL * dt;
+    }
+    if (SDL_SCANCODE_RIGHT < key_count && keys[SDL_SCANCODE_RIGHT]) {
+        state->camera_roll += CAM_FLIGHT_ROLL * dt;
+    }
+    state->camera_roll = clampf(state->camera_roll, -CAM_FLIGHT_ROLL_MAX, CAM_FLIGHT_ROLL_MAX);
+
+    const float cp = cosf(state->camera_pitch);
+    const float forward[3] = {
+        cp * sinf(state->camera_yaw),
+        sinf(state->camera_pitch),
+        cp * cosf(state->camera_yaw),
+    };
+    state->camera_position[0] += forward[0] * state->flight_speed * dt;
+    state->camera_position[1] += forward[1] * state->flight_speed * dt;
+    state->camera_position[2] += forward[2] * state->flight_speed * dt;
+}
+
+/* GROUND: first-person walker. W/S move along the horizontal heading, A/D turn,
+ * mouse looks (event path), gravity pulls toward the surface, SPACE jumps. */
+static void
+update_camera_ground(AppState *state, float dt) {
+    int key_count = 0;
+    const bool *keys = SDL_GetKeyboardState(&key_count);
+    if (keys == NULL) {
+        return;
+    }
+
+    if (SDL_SCANCODE_A < key_count && keys[SDL_SCANCODE_A]) {
+        state->camera_yaw += CAM_GROUND_TURN * dt;
+    }
+    if (SDL_SCANCODE_D < key_count && keys[SDL_SCANCODE_D]) {
+        state->camera_yaw -= CAM_GROUND_TURN * dt;
+    }
+
+    /* Horizontal heading only (ignore pitch so looking up does not slow you). */
+    const float forward[3] = {
+        sinf(state->camera_yaw),
+        0.0f,
+        cosf(state->camera_yaw),
+    };
+    float move = 0.0f;
+    if (SDL_SCANCODE_W < key_count && keys[SDL_SCANCODE_W]) {
+        move += 1.0f;
+    }
+    if (SDL_SCANCODE_S < key_count && keys[SDL_SCANCODE_S]) {
+        move -= 1.0f;
+    }
+    state->camera_position[0] += forward[0] * move * CAM_GROUND_SPEED * dt;
+    state->camera_position[2] += forward[2] * move * CAM_GROUND_SPEED * dt;
+
+    /* Gravity + surface collision. */
+    state->velocity_y -= CAM_GRAVITY * dt;
+    state->camera_position[1] += state->velocity_y * dt;
+    const float floor_y = find_ground_y(
+        &state->terrain_config,
+        state->camera_position[0],
+        state->camera_position[2]
+    ) + CAM_EYE_HEIGHT;
+    if (state->camera_position[1] <= floor_y) {
+        state->camera_position[1] = floor_y;
+        state->velocity_y = 0.0f;
+    }
+}
+
+static void
+update_camera(AppState *state, float dt) {
+    switch (state->camera_mode) {
+        case CAM_FLIGHT:
+            update_camera_flight(state, dt);
+            break;
+        case CAM_GROUND:
+            update_camera_ground(state, dt);
+            break;
+        case CAM_FREE:
+        default:
+            update_camera_free(state, dt);
+            break;
+    }
 }
 
 SDL_AppResult
@@ -780,12 +1196,14 @@ SDL_AppInit(void **appstate, int argc, char *argv[]) {
     if (smoke_frames != NULL) {
         state->smoke_frame_limit = (uint32_t)SDL_atoi(smoke_frames);
     }
-    state->camera_position[0] = 0.0f;
-    state->camera_position[1] = 26.0f;
-    state->camera_position[2] = -72.0f;
-    state->camera_yaw = 0.0f;
-    state->camera_pitch = -0.24f;
-    state->camera_fov_degrees = 60.0f;
+    const char *smoke_drift = getenv("TERRAGEN_SMOKE_DRIFT");
+    if (smoke_drift != NULL) {
+        state->smoke_drift = (float)SDL_atof(smoke_drift);
+    }
+    /* Overlook the region from near its center, matching the original gentle
+     * downward framing (camera above the terrain, looking across it). */
+    state->camera_mode = CAM_FREE;
+    reset_camera(state);
     state->fps = 0.0f;
     state->last_frame_ticks = SDL_GetPerformanceCounter();
 
@@ -838,6 +1256,7 @@ SDL_AppIterate(void *appstate) {
     const float instant_fps = dt > 0.000001f ? 1.0f / dt : 0.0f;
     state->fps = state->fps <= 0.0f ? instant_fps : state->fps * 0.92f + instant_fps * 0.08f;
     update_camera(state, dt);
+    chunk_system_update(state);
 
     SDL_GPUCommandBuffer *command_buffer = SDL_AcquireGPUCommandBuffer(state->device);
 
@@ -884,7 +1303,7 @@ SDL_AppIterate(void *appstate) {
 
     SDL_GPURenderPass *render_pass = SDL_BeginGPURenderPass(command_buffer, &color_target_info, 1u, &depth_info);
     SDL_BindGPUGraphicsPipeline(render_pass, state->graphics_pipeline);
-    terrain_gpu_render(render_pass, &state->terrain);
+    chunk_system_render(state, render_pass);
 
     HudUniform hud = {
         .viewport = {(float)width, (float)height, 0.0f, 0.0f},
@@ -908,7 +1327,8 @@ SDL_AppEvent(void *appstate, SDL_Event *event) {
         return SDL_APP_SUCCESS;
     }
     if (event->type == SDL_EVENT_MOUSE_MOTION) {
-        if ((event->motion.state & SDL_BUTTON_MMASK) != 0u) {
+        /* MMB height nudge is a FREE-mode convenience only. */
+        if (state->camera_mode == CAM_FREE && (event->motion.state & SDL_BUTTON_MMASK) != 0u) {
             state->camera_position[1] = clampf(
                 state->camera_position[1] - event->motion.yrel * 0.18f,
                 -64.0f,
@@ -917,10 +1337,13 @@ SDL_AppEvent(void *appstate, SDL_Event *event) {
             return SDL_APP_CONTINUE;
         }
 
-        const float sensitivity = 0.0025f;
-        state->camera_yaw += event->motion.xrel * sensitivity;
-        state->camera_pitch -= event->motion.yrel * sensitivity;
-        state->camera_pitch = clampf(state->camera_pitch, -1.48f, 1.48f);
+        /* Mouse looks in FREE and GROUND. FLIGHT orientation is keyboard-driven. */
+        if (state->camera_mode != CAM_FLIGHT) {
+            const float sensitivity = 0.0025f;
+            state->camera_yaw += event->motion.xrel * sensitivity;
+            state->camera_pitch -= event->motion.yrel * sensitivity;
+            state->camera_pitch = clampf(state->camera_pitch, -1.48f, 1.48f);
+        }
         return SDL_APP_CONTINUE;
     }
     if (event->type == SDL_EVENT_MOUSE_WHEEL) {
@@ -933,6 +1356,30 @@ SDL_AppEvent(void *appstate, SDL_Event *event) {
         switch (event->key.key) {
             case SDLK_ESCAPE:
                 SDL_SetWindowRelativeMouseMode(state->window, !SDL_GetWindowRelativeMouseMode(state->window));
+                break;
+            case SDLK_TAB:
+                state->camera_mode = (CameraMode)((state->camera_mode + 1) % CAM_MODE_COUNT);
+                /* Clear transient motion so a switched-in mode starts settled. */
+                state->flight_speed = 0.0f;
+                state->velocity_y = 0.0f;
+                state->camera_roll = 0.0f;
+                if (state->camera_mode == CAM_GROUND) {
+                    /* Drop the view to just above the surface immediately. */
+                    state->camera_position[1] = find_ground_y(
+                        &state->terrain_config,
+                        state->camera_position[0],
+                        state->camera_position[2]
+                    ) + CAM_EYE_HEIGHT;
+                }
+                break;
+            case SDLK_SPACE:
+                /* GROUND jump; unlimited air jumps (no grounded check). */
+                if (state->camera_mode == CAM_GROUND) {
+                    state->velocity_y = CAM_JUMP_SPEED;
+                }
+                break;
+            case SDLK_R:
+                reset_camera(state);
                 break;
             case SDLK_J:
                 state->terrain_config.max_height = clampf(
@@ -978,27 +1425,15 @@ SDL_AppEvent(void *appstate, SDL_Event *event) {
                     needs_regen = true;
                 }
                 break;
-            case SDLK_MINUS:
-            case SDLK_KP_MINUS:
-                if (state->terrain_detail > TERRAIN_MIN_DETAIL) {
-                    state->terrain_detail /= 2u;
-                    needs_regen = true;
-                }
-                break;
-            case SDLK_EQUALS:
-            case SDLK_PLUS:
-            case SDLK_KP_PLUS:
-                if (state->terrain_detail < TERRAIN_MAX_DETAIL) {
-                    state->terrain_detail *= 2u;
-                    needs_regen = true;
-                }
-                break;
             default:
                 break;
         }
 
-        if (needs_regen && !regenerate_terrain(state)) {
-            return SDL_APP_FAILURE;
+        if (needs_regen) {
+            /* Refresh derived height fields; the density version is recomputed
+             * from the config each frame (content-addressed), so changed params
+             * invalidate chunks and reverted params reuse the cached ones. */
+            terrain_region_apply_height_range(&state->terrain_config);
         }
     }
 
@@ -1016,7 +1451,11 @@ SDL_AppQuit(void *appstate, SDL_AppResult result) {
     log_info("Shutting down...");
 
     if (state->device != NULL) {
-        terrain_gpu_destroy(state->device, &state->terrain);
+        if (state->chunk_pool != NULL) {
+            for (uint32_t i = 0u; i < state->pool_capacity; i += 1u) {
+                terrain_gpu_destroy(state->device, &state->chunk_pool[i]);
+            }
+        }
         if (state->depth_texture != NULL) {
             SDL_ReleaseGPUTexture(state->device, state->depth_texture);
         }
@@ -1034,7 +1473,8 @@ SDL_AppQuit(void *appstate, SDL_AppResult result) {
         }
         SDL_DestroyGPUDevice(state->device);
     }
-    sparse_grid_destroy(&state->sparse_grid);
+    chunk_cache_destroy(&state->chunk_cache);
+    free(state->chunk_pool);
     if (state->window != NULL) {
         SDL_DestroyWindow(state->window);
     }
