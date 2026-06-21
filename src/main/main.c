@@ -722,7 +722,7 @@ ensure_depth_texture(AppState *state, uint32_t width, uint32_t height) {
 static bool
 initialize_terrain(AppState *state) {
     state->terrain_config = terrain_default_region_config();
-    state->density_version = 1u;
+    state->density_version = terrain_density_hash(&state->terrain_config);
 
     state->pool_capacity = CHUNK_POOL_CAPACITY_DEFAULT;
     const char *pool_env = getenv("TERRAGEN_POOL");
@@ -770,7 +770,7 @@ generate_chunk(AppState *state, SDL_GPUCommandBuffer *command_buffer, ChunkRecor
     const uint32_t cell_count =
         (uint32_t)(layout.array_dim_x * layout.array_dim_y * layout.array_dim_z);
 
-    if (!terrain_gpu_reuse(pipe, &layout, cell_count)) {
+    if (!terrain_gpu_reuse(pipe, &state->terrain_config, &layout, cell_count)) {
         /* The slot held a different-sized chunk (or none): rebuild its buffers.
          * Same-LOD reuse above keeps the common case allocation-free. */
         if (pipe->sample_pipeline != NULL) {
@@ -804,6 +804,10 @@ static void
 chunk_system_update(AppState *state) {
     const float pov_x = state->camera_position[0];
     const float pov_z = state->camera_position[2];
+
+    /* Content-addressed density version: identical params reuse cached chunks
+     * exactly (so reverting a setting heals instantly), any change invalidates. */
+    state->density_version = terrain_density_hash(&state->terrain_config);
 
     state->active_count = chunk_active_set(
         pov_x, pov_z, CHUNK_REGION_TEST,
@@ -1188,11 +1192,10 @@ SDL_AppEvent(void *appstate, SDL_Event *event) {
         }
 
         if (needs_regen) {
-            /* Density parameters changed: refresh derived height fields and bump
-             * the density version. New generation keys cause active chunks to
-             * regenerate gradually while stale ones age out via eviction. */
+            /* Refresh derived height fields; the density version is recomputed
+             * from the config each frame (content-addressed), so changed params
+             * invalidate chunks and reverted params reuse the cached ones. */
             terrain_region_apply_height_range(&state->terrain_config);
-            state->density_version += 1u;
         }
     }
 

@@ -26,6 +26,15 @@ typedef struct TerrainHeightBounds {
 } TerrainHeightBounds;
 
 uint32_t terrain_hash_u32(uint32_t x);
+
+/*
+ * Hash of every parameter that affects terrain_density_sample. Used as a
+ * content-addressed density version in chunk generation keys: identical
+ * parameters always hash the same, so reverting a setting reuses cached chunks
+ * exactly, while any real change invalidates them.
+ */
+uint32_t terrain_density_hash(const TerrainRegionConfig *config);
+
 TerrainRegionConfig terrain_default_region_config(void);
 void terrain_region_apply_height_range(TerrainRegionConfig *config);
 TerrainHeightBounds terrain_region_snap_height_bounds(const TerrainRegionConfig *config);

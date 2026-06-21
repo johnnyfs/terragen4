@@ -252,12 +252,14 @@ terrain_gpu_init(SDL_GPUDevice *device, const TerrainRegionConfig *config, const
 }
 
 bool
-terrain_gpu_reuse(TerrainGpuPipeline *pipeline, const ChunkLayout *layout, uint32_t cell_count) {
+terrain_gpu_reuse(TerrainGpuPipeline *pipeline, const TerrainRegionConfig *config, const ChunkLayout *layout, uint32_t cell_count) {
     if (pipeline->sample_pipeline == NULL || pipeline->cell_count != cell_count) {
         return false;
     }
-    /* Only the origin (and other uniform-only fields) change between chunks of
-     * the same LOD; the uploaded local coordinates are identical. */
+    /* The uploaded local coordinates are identical for a given LOD, so buffers
+     * are reused; the per-chunk origin AND the density parameters still differ,
+     * so both must be refreshed or a reused slot would sample with stale params. */
+    pipeline->config = *config;
     pipeline->layout = *layout;
     const uint32_t owned_area = (uint32_t)(layout->owned_dim_x * layout->owned_dim_z);
     pipeline->max_vertices = owned_area > 0u ? owned_area * 72u : 6u;

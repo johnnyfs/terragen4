@@ -2,6 +2,7 @@
 
 #include <math.h>
 #include <stdint.h>
+#include <string.h>
 
 TerrainRegionConfig
 terrain_default_region_config(void) {
@@ -54,6 +55,27 @@ terrain_hash_u32(uint32_t x) {
     x *= 0x846ca68bu;
     x ^= x >> 16u;
     return x;
+}
+
+static uint32_t
+terrain_mix_f32(uint32_t acc, float value) {
+    uint32_t bits = 0u;
+    memcpy(&bits, &value, sizeof(bits));
+    return terrain_hash_u32(acc ^ terrain_hash_u32(bits + 0x9e3779b9u));
+}
+
+uint32_t
+terrain_density_hash(const TerrainRegionConfig *config) {
+    uint32_t h = terrain_hash_u32(config->seed + 0x01234567u);
+    h = terrain_mix_f32(h, config->noise_frequency);
+    h = terrain_mix_f32(h, config->noise_amplitude);
+    h = terrain_mix_f32(h, config->base_height);
+    h = terrain_mix_f32(h, config->warp_amount);
+    h = terrain_mix_f32(h, config->warp_frequency);
+    h = terrain_mix_f32(h, config->noise_lacunarity);
+    h = terrain_mix_f32(h, config->noise_gain);
+    h ^= terrain_hash_u32(config->noise_octaves + 0x0000abcdu);
+    return terrain_hash_u32(h);
 }
 
 static float
