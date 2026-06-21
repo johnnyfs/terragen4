@@ -37,6 +37,28 @@ typedef struct HudVertex {
 #define CHUNK_MAX_GEN_PER_FRAME 6u
 #define CHUNK_MAX_ACTIVE 4096u
 
+/* Camera modes the user TABs through. FREE is the original free-look camera. */
+typedef enum {
+    CAM_FREE = 0,
+    CAM_FLIGHT,
+    CAM_GROUND,
+    CAM_MODE_COUNT,
+} CameraMode;
+
+/* Camera feel knobs (world units, seconds, radians). */
+#define CAM_EYE_HEIGHT 1.8f      /* GROUND: camera height above the surface */
+#define CAM_GRAVITY 22.0f        /* GROUND: downward accel */
+#define CAM_JUMP_SPEED 9.0f      /* GROUND: upward impulse per SPACE press */
+#define CAM_GROUND_SPEED 24.0f   /* GROUND: walk speed (matches FREE strafe) */
+#define CAM_GROUND_TURN 1.8f     /* GROUND: A/D yaw turn rate */
+#define CAM_FLIGHT_ACCEL 60.0f   /* FLIGHT: throttle accel from W/S */
+#define CAM_FLIGHT_SPEED_MIN -30.0f
+#define CAM_FLIGHT_SPEED_MAX 140.0f
+#define CAM_FLIGHT_TURN 1.6f     /* FLIGHT: A/D yaw turn rate */
+#define CAM_FLIGHT_PITCH 1.4f    /* FLIGHT: up/down pitch rate */
+#define CAM_FLIGHT_ROLL 2.0f     /* FLIGHT: left/right bank rate */
+#define CAM_FLIGHT_ROLL_MAX 1.2f
+
 typedef struct AppState {
     SDL_Window *window;
     SDL_GPUDevice *device;
@@ -84,6 +106,11 @@ typedef struct AppState {
     float camera_yaw;
     float camera_pitch;
     float camera_fov_degrees;
+
+    CameraMode camera_mode;
+    float camera_roll;    /* banking, radians (FLIGHT only; 0 otherwise) */
+    float flight_speed;   /* FLIGHT throttle / forward velocity along facing */
+    float velocity_y;     /* GROUND vertical velocity (gravity + jumps) */
 } AppState;
 
 static SDL_GPUShader *
@@ -225,7 +252,24 @@ make_camera_uniform(const AppState *state, uint32_t width, uint32_t height) {
         state->camera_position[1] + forward[1],
         state->camera_position[2] + forward[2],
     };
-    const float up[3] = {0.0f, 1.0f, 0.0f};
+
+    /* Up vector banked by camera_roll about the forward axis. With roll == 0 this
+     * reduces to world-up (0,1,0), so FREE/GROUND are unaffected. */
+    float up[3] = {0.0f, 1.0f, 0.0f};
+    float world_up[3] = {0.0f, 1.0f, 0.0f};
+    float right[3] = {0};
+    vec3_cross(forward, world_up, right);
+    if (vec3_dot(right, right) > 0.000001f) {
+        vec3_normalize(right);
+        float level_up[3] = {0};
+        vec3_cross(right, forward, level_up);
+        const float cr = cosf(state->camera_roll);
+        const float sr = sinf(state->camera_roll);
+        up[0] = level_up[0] * cr + right[0] * sr;
+        up[1] = level_up[1] * cr + right[1] * sr;
+        up[2] = level_up[2] * cr + right[2] * sr;
+    }
+
     float projection[16] = {0};
     float view[16] = {0};
     CameraUniform camera = {0};
@@ -575,6 +619,17 @@ build_and_upload_hud(AppState *state, SDL_GPUCommandBuffer *command_buffer) {
     hud_emit_text(vertices, &count, x, y, scale, line);
     y += line_step;
 
+    const char *mode_name =
+        state->camera_mode == CAM_FLIGHT ? "FLIGHT" :
+        state->camera_mode == CAM_GROUND ? "GROUND" : "FREE";
+    if (state->camera_mode == CAM_FLIGHT) {
+        SDL_snprintf(line, sizeof(line), "MODE %s  SPEED %.0f  [TAB]", mode_name, state->flight_speed);
+    } else {
+        SDL_snprintf(line, sizeof(line), "MODE %s  [TAB]", mode_name);
+    }
+    hud_emit_text(vertices, &count, x, y, scale, line);
+    y += line_step;
+
     SDL_snprintf(
         line,
         sizeof(line),
@@ -649,7 +704,11 @@ build_and_upload_hud(AppState *state, SDL_GPUCommandBuffer *command_buffer) {
     hud_emit_text(vertices, &count, x, y, scale, line);
     y += line_step;
 
-    hud_emit_text(vertices, &count, x, y, scale, "WASD MOVE  MMB UP/DOWN  ESC MOUSE");
+    const char *help =
+        state->camera_mode == CAM_FLIGHT ? "W/S THROTTLE  A/D TURN  ARROWS PITCH/ROLL  R RESET" :
+        state->camera_mode == CAM_GROUND ? "WASD MOVE/TURN  MOUSE LOOK  SPACE JUMP  R RESET" :
+        "WASD MOVE  MMB UP/DOWN  ESC MOUSE  R RESET";
+    hud_emit_text(vertices, &count, x, y, scale, help);
 
     SDL_UnmapGPUTransferBuffer(state->device, state->hud_transfer_buffer);
     state->hud_vertex_count = count;
@@ -916,8 +975,49 @@ chunk_system_render(AppState *state, SDL_GPURenderPass *render_pass) {
     }
 }
 
+/* Find the terrain surface height at (x, z) by locating the SDF zero-crossing of
+ * terrain_density_sample (the same field the visible mesh is built from). The SDF
+ * is negative inside solid terrain and positive in air. No chunk data is required,
+ * so this works anywhere in the streamed region. */
+static float
+find_ground_y(const TerrainRegionConfig *cfg, float x, float z) {
+    float y_hi = cfg->max_height + 32.0f; /* expected to be air */
+    float y_lo = cfg->min_height - 32.0f; /* expected to be solid */
+    /* Guard the brackets in case the expected sign does not hold. */
+    if (terrain_density_sample(cfg, x, y_hi, z) <= 0.0f) {
+        return y_hi;
+    }
+    if (terrain_density_sample(cfg, x, y_lo, z) >= 0.0f) {
+        return y_lo;
+    }
+    for (int i = 0; i < 24; i += 1) {
+        const float mid = (y_hi + y_lo) * 0.5f;
+        if (terrain_density_sample(cfg, x, mid, z) > 0.0f) {
+            y_hi = mid; /* air */
+        } else {
+            y_lo = mid; /* solid */
+        }
+    }
+    return (y_hi + y_lo) * 0.5f;
+}
+
+/* Restore the camera to its starting pose and clear transient motion state. Shared
+ * by SDL_AppInit and the R key. */
 static void
-update_camera(AppState *state, float dt) {
+reset_camera(AppState *state) {
+    state->camera_position[0] = chunk_region_extent() * 0.5f;
+    state->camera_position[1] = 34.0f;
+    state->camera_position[2] = chunk_region_extent() * 0.5f - 78.0f;
+    state->camera_yaw = 0.0f;
+    state->camera_pitch = -0.24f;
+    state->camera_fov_degrees = 60.0f;
+    state->camera_roll = 0.0f;
+    state->flight_speed = 0.0f;
+    state->velocity_y = 0.0f;
+}
+
+static void
+update_camera_free(AppState *state, float dt) {
     int key_count = 0;
     const bool *keys = SDL_GetKeyboardState(&key_count);
     if (keys == NULL) {
@@ -967,6 +1067,120 @@ update_camera(AppState *state, float dt) {
     }
 }
 
+/* FLIGHT: airplane-style camera. W/S throttle, A/D yaw turn, up/down pitch,
+ * left/right bank (roll). Moves along the full 3D facing direction. */
+static void
+update_camera_flight(AppState *state, float dt) {
+    int key_count = 0;
+    const bool *keys = SDL_GetKeyboardState(&key_count);
+    if (keys == NULL) {
+        return;
+    }
+
+    if (SDL_SCANCODE_W < key_count && keys[SDL_SCANCODE_W]) {
+        state->flight_speed += CAM_FLIGHT_ACCEL * dt;
+    }
+    if (SDL_SCANCODE_S < key_count && keys[SDL_SCANCODE_S]) {
+        state->flight_speed -= CAM_FLIGHT_ACCEL * dt;
+    }
+    state->flight_speed = clampf(state->flight_speed, CAM_FLIGHT_SPEED_MIN, CAM_FLIGHT_SPEED_MAX);
+
+    if (SDL_SCANCODE_A < key_count && keys[SDL_SCANCODE_A]) {
+        state->camera_yaw += CAM_FLIGHT_TURN * dt;
+    }
+    if (SDL_SCANCODE_D < key_count && keys[SDL_SCANCODE_D]) {
+        state->camera_yaw -= CAM_FLIGHT_TURN * dt;
+    }
+    if (SDL_SCANCODE_UP < key_count && keys[SDL_SCANCODE_UP]) {
+        state->camera_pitch += CAM_FLIGHT_PITCH * dt;
+    }
+    if (SDL_SCANCODE_DOWN < key_count && keys[SDL_SCANCODE_DOWN]) {
+        state->camera_pitch -= CAM_FLIGHT_PITCH * dt;
+    }
+    state->camera_pitch = clampf(state->camera_pitch, -1.48f, 1.48f);
+
+    if (SDL_SCANCODE_LEFT < key_count && keys[SDL_SCANCODE_LEFT]) {
+        state->camera_roll -= CAM_FLIGHT_ROLL * dt;
+    }
+    if (SDL_SCANCODE_RIGHT < key_count && keys[SDL_SCANCODE_RIGHT]) {
+        state->camera_roll += CAM_FLIGHT_ROLL * dt;
+    }
+    state->camera_roll = clampf(state->camera_roll, -CAM_FLIGHT_ROLL_MAX, CAM_FLIGHT_ROLL_MAX);
+
+    const float cp = cosf(state->camera_pitch);
+    const float forward[3] = {
+        cp * sinf(state->camera_yaw),
+        sinf(state->camera_pitch),
+        cp * cosf(state->camera_yaw),
+    };
+    state->camera_position[0] += forward[0] * state->flight_speed * dt;
+    state->camera_position[1] += forward[1] * state->flight_speed * dt;
+    state->camera_position[2] += forward[2] * state->flight_speed * dt;
+}
+
+/* GROUND: first-person walker. W/S move along the horizontal heading, A/D turn,
+ * mouse looks (event path), gravity pulls toward the surface, SPACE jumps. */
+static void
+update_camera_ground(AppState *state, float dt) {
+    int key_count = 0;
+    const bool *keys = SDL_GetKeyboardState(&key_count);
+    if (keys == NULL) {
+        return;
+    }
+
+    if (SDL_SCANCODE_A < key_count && keys[SDL_SCANCODE_A]) {
+        state->camera_yaw += CAM_GROUND_TURN * dt;
+    }
+    if (SDL_SCANCODE_D < key_count && keys[SDL_SCANCODE_D]) {
+        state->camera_yaw -= CAM_GROUND_TURN * dt;
+    }
+
+    /* Horizontal heading only (ignore pitch so looking up does not slow you). */
+    const float forward[3] = {
+        sinf(state->camera_yaw),
+        0.0f,
+        cosf(state->camera_yaw),
+    };
+    float move = 0.0f;
+    if (SDL_SCANCODE_W < key_count && keys[SDL_SCANCODE_W]) {
+        move += 1.0f;
+    }
+    if (SDL_SCANCODE_S < key_count && keys[SDL_SCANCODE_S]) {
+        move -= 1.0f;
+    }
+    state->camera_position[0] += forward[0] * move * CAM_GROUND_SPEED * dt;
+    state->camera_position[2] += forward[2] * move * CAM_GROUND_SPEED * dt;
+
+    /* Gravity + surface collision. */
+    state->velocity_y -= CAM_GRAVITY * dt;
+    state->camera_position[1] += state->velocity_y * dt;
+    const float floor_y = find_ground_y(
+        &state->terrain_config,
+        state->camera_position[0],
+        state->camera_position[2]
+    ) + CAM_EYE_HEIGHT;
+    if (state->camera_position[1] <= floor_y) {
+        state->camera_position[1] = floor_y;
+        state->velocity_y = 0.0f;
+    }
+}
+
+static void
+update_camera(AppState *state, float dt) {
+    switch (state->camera_mode) {
+        case CAM_FLIGHT:
+            update_camera_flight(state, dt);
+            break;
+        case CAM_GROUND:
+            update_camera_ground(state, dt);
+            break;
+        case CAM_FREE:
+        default:
+            update_camera_free(state, dt);
+            break;
+    }
+}
+
 SDL_AppResult
 SDL_AppInit(void **appstate, int argc, char *argv[]) {
     (void)argc;
@@ -988,12 +1202,8 @@ SDL_AppInit(void **appstate, int argc, char *argv[]) {
     }
     /* Overlook the region from near its center, matching the original gentle
      * downward framing (camera above the terrain, looking across it). */
-    state->camera_position[0] = chunk_region_extent() * 0.5f;
-    state->camera_position[1] = 34.0f;
-    state->camera_position[2] = chunk_region_extent() * 0.5f - 78.0f;
-    state->camera_yaw = 0.0f;
-    state->camera_pitch = -0.24f;
-    state->camera_fov_degrees = 60.0f;
+    state->camera_mode = CAM_FREE;
+    reset_camera(state);
     state->fps = 0.0f;
     state->last_frame_ticks = SDL_GetPerformanceCounter();
 
@@ -1117,7 +1327,8 @@ SDL_AppEvent(void *appstate, SDL_Event *event) {
         return SDL_APP_SUCCESS;
     }
     if (event->type == SDL_EVENT_MOUSE_MOTION) {
-        if ((event->motion.state & SDL_BUTTON_MMASK) != 0u) {
+        /* MMB height nudge is a FREE-mode convenience only. */
+        if (state->camera_mode == CAM_FREE && (event->motion.state & SDL_BUTTON_MMASK) != 0u) {
             state->camera_position[1] = clampf(
                 state->camera_position[1] - event->motion.yrel * 0.18f,
                 -64.0f,
@@ -1126,10 +1337,13 @@ SDL_AppEvent(void *appstate, SDL_Event *event) {
             return SDL_APP_CONTINUE;
         }
 
-        const float sensitivity = 0.0025f;
-        state->camera_yaw += event->motion.xrel * sensitivity;
-        state->camera_pitch -= event->motion.yrel * sensitivity;
-        state->camera_pitch = clampf(state->camera_pitch, -1.48f, 1.48f);
+        /* Mouse looks in FREE and GROUND. FLIGHT orientation is keyboard-driven. */
+        if (state->camera_mode != CAM_FLIGHT) {
+            const float sensitivity = 0.0025f;
+            state->camera_yaw += event->motion.xrel * sensitivity;
+            state->camera_pitch -= event->motion.yrel * sensitivity;
+            state->camera_pitch = clampf(state->camera_pitch, -1.48f, 1.48f);
+        }
         return SDL_APP_CONTINUE;
     }
     if (event->type == SDL_EVENT_MOUSE_WHEEL) {
@@ -1142,6 +1356,30 @@ SDL_AppEvent(void *appstate, SDL_Event *event) {
         switch (event->key.key) {
             case SDLK_ESCAPE:
                 SDL_SetWindowRelativeMouseMode(state->window, !SDL_GetWindowRelativeMouseMode(state->window));
+                break;
+            case SDLK_TAB:
+                state->camera_mode = (CameraMode)((state->camera_mode + 1) % CAM_MODE_COUNT);
+                /* Clear transient motion so a switched-in mode starts settled. */
+                state->flight_speed = 0.0f;
+                state->velocity_y = 0.0f;
+                state->camera_roll = 0.0f;
+                if (state->camera_mode == CAM_GROUND) {
+                    /* Drop the view to just above the surface immediately. */
+                    state->camera_position[1] = find_ground_y(
+                        &state->terrain_config,
+                        state->camera_position[0],
+                        state->camera_position[2]
+                    ) + CAM_EYE_HEIGHT;
+                }
+                break;
+            case SDLK_SPACE:
+                /* GROUND jump; unlimited air jumps (no grounded check). */
+                if (state->camera_mode == CAM_GROUND) {
+                    state->velocity_y = CAM_JUMP_SPEED;
+                }
+                break;
+            case SDLK_R:
+                reset_camera(state);
                 break;
             case SDLK_J:
                 state->terrain_config.max_height = clampf(
