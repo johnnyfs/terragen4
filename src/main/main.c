@@ -846,9 +846,9 @@ generate_chunk(AppState *state, SDL_GPUCommandBuffer *command_buffer, ChunkRecor
         }
     }
 
-    /* Seam geometry depends on neighbour LODs; it is part of the chunk's key, so
-     * set it after reuse/init (both of which leave it untouched / zeroed). */
-    pipe->seam_mask = rec->key.seam_mask;
+    /* Seam geometry depends on neighbour LODs (tracked per record, not in the
+     * key); set it after reuse/init (both of which leave it untouched/zeroed). */
+    pipe->seam_mask = rec->seam_want;
 
     rec->mem_estimate =
         (size_t)cell_count * (sizeof(SparseGridCoord) + 96u) +
@@ -877,13 +877,6 @@ chunk_system_update(AppState *state) {
         state->density_version, 1u, 1u, state->active_keys, CHUNK_MAX_ACTIVE
     );
 
-    /* Resolve per-chunk seam masks from neighbour LODs before any cache lookup,
-     * so the mask is part of each chunk's identity. */
-    for (size_t i = 0u; i < state->active_count; i += 1u) {
-        state->active_keys[i].seam_mask =
-            chunk_seam_mask(state->active_keys, state->active_count, i);
-    }
-
     state->dbg_active = (uint32_t)state->active_count;
     state->dbg_hits = 0u;
     state->dbg_misses = 0u;
@@ -895,14 +888,22 @@ chunk_system_update(AppState *state) {
 
     for (size_t i = 0u; i < state->active_count; i += 1u) {
         const ChunkGenKey key = state->active_keys[i];
+        const uint32_t desired_seam = chunk_seam_mask(state->active_keys, state->active_count, i);
         if (key.lod < CHUNK_LOD_COUNT) {
             state->dbg_lod[key.lod] += 1u;
         }
         ChunkRecord *rec = chunk_cache_find(&state->chunk_cache, &key);
         if (rec != NULL) {
             rec->last_used_frame = state->frame_count;
+            rec->seam_want = desired_seam;
             if (rec->status == CHUNK_STATUS_READY) {
                 state->dbg_hits += 1u;
+                /* Neighbour LOD changed -> refresh skirts in place. The chunk
+                 * keeps rendering its current mesh until the refresh runs, so it
+                 * never blinks out (seams are not part of cache identity). */
+                if (rec->seam_built != desired_seam) {
+                    chunk_queue_push_if_absent(&state->chunk_cache, &key);
+                }
             }
             continue;
         }
@@ -927,6 +928,7 @@ chunk_system_update(AppState *state) {
         rec = chunk_cache_insert(&state->chunk_cache, &key, cx, cz);
         if (rec != NULL) {
             rec->last_used_frame = state->frame_count;
+            rec->seam_want = desired_seam;
             chunk_queue_push_if_absent(&state->chunk_cache, &key);
         }
     }
@@ -939,18 +941,27 @@ chunk_system_update(AppState *state) {
                 break;
             }
             ChunkRecord *rec = chunk_cache_find(&state->chunk_cache, &key);
-            if (rec == NULL || rec->status != CHUNK_STATUS_QUEUED) {
-                continue; /* evicted or already handled before generation ran */
+            if (rec == NULL) {
+                continue; /* evicted before generation ran */
             }
-            rec->status = CHUNK_STATUS_GENERATING;
+            const bool fresh = (rec->status == CHUNK_STATUS_QUEUED);
+            const bool refresh = (rec->status == CHUNK_STATUS_READY && rec->seam_built != rec->seam_want);
+            if (!fresh && !refresh) {
+                continue; /* already up to date or mid-flight */
+            }
+            if (fresh) {
+                rec->status = CHUNK_STATUS_GENERATING;
+            }
             if (generate_chunk(state, command_buffer, rec)) {
                 rec->status = CHUNK_STATUS_READY;
+                rec->seam_built = rec->seam_want;
                 state->dbg_generated += 1u;
                 state->dbg_generated_total += 1u;
-            } else {
+            } else if (fresh) {
                 rec->status = CHUNK_STATUS_FAILED;
                 state->dbg_failed += 1u;
             }
+            /* A failed refresh keeps the chunk READY with its prior mesh. */
         }
         SDL_SubmitGPUCommandBuffer(command_buffer);
     }

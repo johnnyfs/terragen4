@@ -60,8 +60,11 @@ typedef struct ChunkAabb2 {
 /*
  * Stable generation key for a chunk. region_id is reserved so a future region
  * graph can add per-region dependency keys without reshaping this struct.
- * seam_mask captures which borders face a different LOD, so a chunk's seam
- * geometry is part of its cached identity (only ring-boundary chunks change it).
+ *
+ * Note: the seam mask is deliberately NOT part of identity. Neighbour LODs
+ * change continuously as the POV moves; keying on them would make boundary
+ * chunks miss the cache and blink out while regenerating. Instead the mask is
+ * tracked per cache record and the chunk's skirts are refreshed in place.
  */
 typedef struct ChunkGenKey {
     uint32_t region_id;
@@ -71,7 +74,6 @@ typedef struct ChunkGenKey {
     uint32_t density_version;
     uint32_t mesh_version;
     uint32_t material_version;
-    uint32_t seam_mask;
 } ChunkGenKey;
 
 /* Per-LOD scale. */

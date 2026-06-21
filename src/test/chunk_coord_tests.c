@@ -316,12 +316,6 @@ test_seam_mask(void) {
             }
         }
     }
-
-    /* seam_mask participates in identity. */
-    ChunkGenKey a = keys[home];
-    ChunkGenKey b2 = a;
-    b2.seam_mask = CHUNK_SEAM_POS_X;
-    assert(!chunk_genkey_equals(&a, &b2));
 }
 
 static void

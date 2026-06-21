@@ -127,8 +127,7 @@ chunk_genkey_equals(const ChunkGenKey *a, const ChunkGenKey *b) {
            a->lod == b->lod &&
            a->density_version == b->density_version &&
            a->mesh_version == b->mesh_version &&
-           a->material_version == b->material_version &&
-           a->seam_mask == b->seam_mask;
+           a->material_version == b->material_version;
 }
 
 uint32_t
@@ -142,7 +141,6 @@ chunk_genkey_hash(const ChunkGenKey *key) {
     h ^= terrain_hash_u32(key->density_version + 0x165667b1u);
     h ^= terrain_hash_u32(key->mesh_version + 0xd3a2646cu);
     h ^= terrain_hash_u32(key->material_version + 0xfd7046c5u);
-    h ^= terrain_hash_u32(key->seam_mask + 0xb5297a4du);
     return terrain_hash_u32(h);
 }
 
