@@ -1,0 +1,12 @@
+Terrain material textures
+=========================
+Source: ambientCG (https://ambientcg.com) — License: CC0 1.0 (public domain).
+No attribution required; recorded here for provenance.
+
+Palette "vibes" (flat ground + slope rock), see src/main/materials.c:
+  Meadow   : grass         <- Grass004 | slate_gray  <- Rock023
+  Badlands : dirt_badlands <- Ground068| slate_red   <- Rock029
+  Tundra   : dirt_tan      <- Ground054| slate_dark  <- Rock031
+  Mesa     : dirt_pebble   <- Ground078| slate_white <- Rock017
+
+All maps are Color + NormalGL at 1K. Regenerate with: scripts/fetch_textures.sh

@@ -7,6 +7,8 @@
 
 #include "chunk_cache.h"
 #include "chunk_coord.h"
+#include "gpu_texture.h"
+#include "materials.h"
 #include "sparse_grid.h"
 #include "terrain_config.h"
 #include "terrain_gpu.h"
@@ -22,6 +24,14 @@ typedef struct CameraUniform {
 typedef struct HudUniform {
     float viewport[4];
 } HudUniform;
+
+/* Fragment lighting uniform (set=3 binding=0; matches fragment.frag). */
+typedef struct LightingUniform {
+    float sun_dir[4];    /* xyz = direction toward the sun (shader normalizes) */
+    float sun_color[4];  /* rgb = directional light colour * intensity */
+    float ambient[4];    /* rgb = ambient colour * intensity */
+    float params[4];     /* x = base tile (world units/repeat), y = normal strength */
+} LightingUniform;
 
 typedef struct HudVertex {
     float position[2];
@@ -65,6 +75,9 @@ typedef struct AppState {
     SDL_GPUDevice *device;
     SDL_GPUGraphicsPipeline *graphics_pipeline;
     SDL_GPUGraphicsPipeline *hud_pipeline;
+    SDL_GPUTexture *material_albedo;   /* 2D array, one layer per material */
+    SDL_GPUTexture *material_normal;   /* 2D array, one layer per material */
+    SDL_GPUSampler *material_sampler;
     SDL_GPUTexture *depth_texture;
     uint32_t depth_width;
     uint32_t depth_height;
@@ -114,10 +127,12 @@ typedef struct AppState {
     float camera_roll;    /* banking, radians (FLIGHT only; 0 otherwise) */
     float flight_speed;   /* FLIGHT throttle / forward velocity along facing */
     float velocity_y;     /* GROUND vertical velocity (gravity + jumps) */
+
+    uint32_t palette_index;   /* active material "vibe"; cycled with P */
 } AppState;
 
 static SDL_GPUShader *
-compile_shader(const char *path, SDL_GPUShaderStage stage, SDL_GPUDevice *device, uint32_t uniform_buffers) {
+compile_shader(const char *path, SDL_GPUShaderStage stage, SDL_GPUDevice *device, uint32_t uniform_buffers, uint32_t samplers) {
     size_t code_size = 0u;
     void *code = SDL_LoadFile(path, &code_size);
     if (code == NULL) {
@@ -140,6 +155,7 @@ compile_shader(const char *path, SDL_GPUShaderStage stage, SDL_GPUDevice *device
         .format = SDL_GPU_SHADERFORMAT_SPIRV,
         .stage = stage,
         .num_uniform_buffers = uniform_buffers,
+        .num_samplers = samplers,
     };
 
     SDL_GPUShader *shader = SDL_CreateGPUShader(device, &info);
@@ -283,19 +299,62 @@ make_camera_uniform(const AppState *state, uint32_t width, uint32_t height) {
     return camera;
 }
 
+static LightingUniform
+make_lighting_uniform(const AppState *state) {
+    /* Sun + sky fill and texture scale come from the active palette. params.z is
+     * the palette's base texture-array layer (palette * MATERIALS_PER_PALETTE),
+     * which the fragment shader adds to each logical material id. base_tile is the
+     * world units per texture repeat at LOD 0; the mesh shader multiplies it by
+     * the per-vertex LOD cell size. */
+    const TerrainPalette *p = palette_get(state->palette_index);
+    const float base_layer = (float)(state->palette_index * MATERIALS_PER_PALETTE);
+    return (LightingUniform) {
+        .sun_dir = {0.35f, 0.85f, 0.35f, 0.0f},
+        .sun_color = {p->sun_color[0], p->sun_color[1], p->sun_color[2], 0.0f},
+        .ambient = {p->ambient[0], p->ambient[1], p->ambient[2], 0.0f},
+        .params = {p->base_tile, 1.0f, base_layer, 0.0f},
+    };
+}
+
+/* Build the albedo + normal texture arrays (one layer per material) and a shared
+ * sampler from the material table. */
+static bool
+create_material_textures(AppState *state) {
+    const uint32_t count = material_layer_count();
+    const char *albedo_paths[32];
+    const char *normal_paths[32];
+    if (count > 32u) {
+        log_error("Material table too large (%u > 32)", count);
+        return false;
+    }
+    materials_albedo_paths(albedo_paths);
+    materials_normal_paths(normal_paths);
+
+    state->material_albedo = gpu_texture_array_load(state->device, albedo_paths, count, 1024u, true);
+    state->material_normal = gpu_texture_array_load(state->device, normal_paths, count, 1024u, false);
+    state->material_sampler = gpu_sampler_create(state->device);
+    if (state->material_albedo == NULL || state->material_normal == NULL || state->material_sampler == NULL) {
+        log_error("Could not create material textures");
+        return false;
+    }
+    return true;
+}
+
 static bool
 create_graphics_pipeline(AppState *state) {
     SDL_GPUShader *vertex_shader = compile_shader(
         "res/shaders/compiled/vertex.vert.spv",
         SDL_GPU_SHADERSTAGE_VERTEX,
         state->device,
-        1u
+        1u,
+        0u
     );
     SDL_GPUShader *fragment_shader = compile_shader(
         "res/shaders/compiled/fragment.frag.spv",
         SDL_GPU_SHADERSTAGE_FRAGMENT,
         state->device,
-        0u
+        1u,
+        2u
     );
     if (vertex_shader == NULL || fragment_shader == NULL) {
         return false;
@@ -380,12 +439,14 @@ create_hud_pipeline(AppState *state) {
         "res/shaders/compiled/hud.vert.spv",
         SDL_GPU_SHADERSTAGE_VERTEX,
         state->device,
-        1u
+        1u,
+        0u
     );
     SDL_GPUShader *fragment_shader = compile_shader(
         "res/shaders/compiled/hud.frag.spv",
         SDL_GPU_SHADERSTAGE_FRAGMENT,
         state->device,
+        0u,
         0u
     );
     if (vertex_shader == NULL || fragment_shader == NULL) {
@@ -707,10 +768,21 @@ build_and_upload_hud(AppState *state, SDL_GPUCommandBuffer *command_buffer) {
     hud_emit_text(vertices, &count, x, y, scale, line);
     y += line_step;
 
+    SDL_snprintf(
+        line,
+        sizeof(line),
+        "P VIBE %s %u/%u",
+        palette_get(state->palette_index)->name,
+        state->palette_index + 1u,
+        palette_count()
+    );
+    hud_emit_text(vertices, &count, x, y, scale, line);
+    y += line_step;
+
     const char *help =
-        state->camera_mode == CAM_FLIGHT ? "W/S THROTTLE  A/D TURN  ARROWS PITCH/ROLL  R RESET" :
-        state->camera_mode == CAM_GROUND ? "WASD MOVE/TURN  MOUSE LOOK  SPACE JUMP  R RESET" :
-        "WASD MOVE  MMB UP/DOWN  ESC MOUSE  R RESET";
+        state->camera_mode == CAM_FLIGHT ? "W/S THROTTLE  A/D TURN  ARROWS PITCH/ROLL  P VIBE  R RESET" :
+        state->camera_mode == CAM_GROUND ? "WASD MOVE/TURN  MOUSE LOOK  SPACE JUMP  P VIBE  R RESET" :
+        "WASD MOVE  MMB UP/DOWN  P VIBE  ESC MOUSE  R RESET";
     hud_emit_text(vertices, &count, x, y, scale, help);
 
     SDL_UnmapGPUTransferBuffer(state->device, state->hud_transfer_buffer);
@@ -877,7 +949,7 @@ chunk_system_update(AppState *state) {
 
     state->active_count = chunk_active_set_hyst(
         pov_x, pov_z, CHUNK_REGION_TEST,
-        state->density_version, 1u, 1u, state->active_keys, CHUNK_MAX_ACTIVE,
+        state->density_version, 1u, materials_version_hash(), state->active_keys, CHUNK_MAX_ACTIVE,
         state->prev_active_keys, state->prev_active_count, CHUNK_LOD_HYSTERESIS
     );
 
@@ -1280,6 +1352,10 @@ SDL_AppInit(void **appstate, int argc, char *argv[]) {
     if (smoke_drift != NULL) {
         state->smoke_drift = (float)SDL_atof(smoke_drift);
     }
+    const char *palette = getenv("TERRAGEN_PALETTE");
+    if (palette != NULL) {
+        state->palette_index = (uint32_t)SDL_atoi(palette) % palette_count();
+    }
     /* Overlook the region from near its center, matching the original gentle
      * downward framing (camera above the terrain, looking across it). */
     state->camera_mode = CAM_FREE;
@@ -1293,6 +1369,12 @@ SDL_AppInit(void **appstate, int argc, char *argv[]) {
         return SDL_APP_FAILURE;
     }
     SDL_ShowWindow(state->window);
+    if (getenv("TERRAGEN_PALETTE") != NULL) {
+        /* Deterministic placement so capture tooling can find this window even
+         * when another instance is open on the same display. */
+        SDL_SetWindowPosition(state->window, 0, 0);
+        SDL_RaiseWindow(state->window);
+    }
 
     state->device = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_SPIRV, true, NULL);
     if (state->device == NULL) {
@@ -1307,6 +1389,9 @@ SDL_AppInit(void **appstate, int argc, char *argv[]) {
     }
 
     if (!create_graphics_pipeline(state)) {
+        return SDL_APP_FAILURE;
+    }
+    if (!create_material_textures(state)) {
         return SDL_APP_FAILURE;
     }
     if (!create_hud_pipeline(state)) {
@@ -1380,9 +1465,16 @@ SDL_AppIterate(void *appstate) {
 
     CameraUniform camera = make_camera_uniform(state, width, height);
     SDL_PushGPUVertexUniformData(command_buffer, 0u, &camera, sizeof(camera));
+    LightingUniform lighting = make_lighting_uniform(state);
+    SDL_PushGPUFragmentUniformData(command_buffer, 0u, &lighting, sizeof(lighting));
 
     SDL_GPURenderPass *render_pass = SDL_BeginGPURenderPass(command_buffer, &color_target_info, 1u, &depth_info);
     SDL_BindGPUGraphicsPipeline(render_pass, state->graphics_pipeline);
+    SDL_GPUTextureSamplerBinding material_bindings[2] = {
+        {.texture = state->material_albedo, .sampler = state->material_sampler},
+        {.texture = state->material_normal, .sampler = state->material_sampler},
+    };
+    SDL_BindGPUFragmentSamplers(render_pass, 0u, material_bindings, 2u);
     chunk_system_render(state, render_pass);
 
     HudUniform hud = {
@@ -1461,6 +1553,12 @@ SDL_AppEvent(void *appstate, SDL_Event *event) {
             case SDLK_R:
                 reset_camera(state);
                 break;
+            case SDLK_P:
+                /* Cycle the material palette ("vibe"). Resolved per-fragment, so
+                 * no chunk regeneration is needed. */
+                state->palette_index = (state->palette_index + 1u) % palette_count();
+                log_info("Palette: %s", palette_get(state->palette_index)->name);
+                break;
             case SDLK_J:
                 state->terrain_config.max_height = clampf(
                     state->terrain_config.max_height - 2.0f,
@@ -1535,6 +1633,15 @@ SDL_AppQuit(void *appstate, SDL_AppResult result) {
             for (uint32_t i = 0u; i < state->pool_capacity; i += 1u) {
                 terrain_gpu_destroy(state->device, &state->chunk_pool[i]);
             }
+        }
+        if (state->material_albedo != NULL) {
+            SDL_ReleaseGPUTexture(state->device, state->material_albedo);
+        }
+        if (state->material_normal != NULL) {
+            SDL_ReleaseGPUTexture(state->device, state->material_normal);
+        }
+        if (state->material_sampler != NULL) {
+            SDL_ReleaseGPUSampler(state->device, state->material_sampler);
         }
         if (state->depth_texture != NULL) {
             SDL_ReleaseGPUTexture(state->device, state->depth_texture);

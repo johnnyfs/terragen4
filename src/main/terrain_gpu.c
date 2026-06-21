@@ -2,6 +2,7 @@
 
 #include <stddef.h>
 
+#include "chunk_coord.h"
 #include "log.h"
 
 typedef struct TerrainGpuParams {
@@ -10,7 +11,7 @@ typedef struct TerrainGpuParams {
     float noise[4];      /* cell_size, noise_freq, noise_amp, base_height */
     float field[4];      /* warp_amount, warp_freq, lacunarity, gain */
     float chunk[4];      /* origin_x, origin_y, origin_z, skirt_depth */
-    int32_t lmin[4];     /* local_min_x, local_min_z, _, _ */
+    int32_t lmin[4];     /* local_min_x, local_min_z, region_id, _ */
     int32_t omin[4];     /* owned_min_x, owned_min_y, owned_min_z, _ */
     int32_t odim[4];     /* owned_dim_x, owned_dim_y, owned_dim_z, _ */
 } TerrainGpuParams;
@@ -118,7 +119,9 @@ make_params(const TerrainGpuPipeline *pipeline) {
              * this chunk has no transition borders. */
             pipeline->seam_mask != 0u ? layout->cell_size * 8.0f : 0.0f,
         },
-        .lmin = {layout->local_min_x, layout->local_min_z, 0, 0},
+        /* region_id is fixed to the single test region today; the future region
+         * graph will supply per-chunk ids so regions can pick distinct materials. */
+        .lmin = {layout->local_min_x, layout->local_min_z, (int32_t)CHUNK_REGION_TEST, 0},
         .omin = {
             layout->owned_min_x,
             layout->owned_min_y,
