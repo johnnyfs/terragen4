@@ -5,14 +5,14 @@
 #include "chunk_coord.h"
 
 ChunkLayout
-sparse_grid_chunk_layout(const TerrainRegionConfig *config, uint32_t lod, int32_t cx, int32_t cz) {
+sparse_grid_chunk_layout_packet(const TerrainFieldPacket *packet, uint32_t lod, int32_t cx, int32_t cz) {
     const float cell = chunk_cell_size(lod);
 
     /* Height bounds are snapped at this LOD's cell size so coarser chunks hold
      * proportionally fewer Y cells while covering the same world height range. */
-    TerrainRegionConfig at_lod = *config;
-    at_lod.grid_resolution = cell;
-    const TerrainHeightBounds hb = terrain_region_snap_height_bounds(&at_lod);
+    TerrainFieldPacket at_lod = *packet;
+    at_lod.base.grid_resolution = cell;
+    const TerrainHeightBounds hb = terrain_field_packet_snap_height_bounds(&at_lod);
 
     const ChunkCoord coord = {.cx = cx, .cz = cz, .lod = lod};
     float origin_x = 0.0f;
@@ -46,11 +46,17 @@ sparse_grid_chunk_layout(const TerrainRegionConfig *config, uint32_t lod, int32_
     return layout;
 }
 
+ChunkLayout
+sparse_grid_chunk_layout(const TerrainRegionConfig *config, uint32_t lod, int32_t cx, int32_t cz) {
+    TerrainFieldPacket packet = terrain_field_packet_from_config(config);
+    return sparse_grid_chunk_layout_packet(&packet, lod, cx, cz);
+}
+
 bool
-sparse_grid_create_chunk(SparseGrid *grid, const TerrainRegionConfig *config, uint32_t lod, int32_t cx, int32_t cz) {
+sparse_grid_create_chunk_packet(SparseGrid *grid, const TerrainFieldPacket *packet, uint32_t lod, int32_t cx, int32_t cz) {
     *grid = (SparseGrid) {0};
 
-    const ChunkLayout layout = sparse_grid_chunk_layout(config, lod, cx, cz);
+    const ChunkLayout layout = sparse_grid_chunk_layout_packet(packet, lod, cx, cz);
     grid->size_x = (uint32_t)layout.array_dim_x;
     grid->size_z = (uint32_t)layout.array_dim_z;
     grid->min_y = layout.local_min_y;
@@ -88,6 +94,12 @@ sparse_grid_create_chunk(SparseGrid *grid, const TerrainRegionConfig *config, ui
 
     grid->count = count;
     return true;
+}
+
+bool
+sparse_grid_create_chunk(SparseGrid *grid, const TerrainRegionConfig *config, uint32_t lod, int32_t cx, int32_t cz) {
+    TerrainFieldPacket packet = terrain_field_packet_from_config(config);
+    return sparse_grid_create_chunk_packet(grid, &packet, lod, cx, cz);
 }
 
 bool

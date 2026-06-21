@@ -4,6 +4,7 @@ project(terragen)
 file(GLOB_RECURSE sources src/main/*.c src/main/*.h)
 file(GLOB_RECURSE sources_test src/test/*.c)
 file(GLOB_RECURSE sources_shaders res/*.vert res/*.frag res/*.comp)
+file(GLOB_RECURSE shader_includes res/shaders/*.glsl)
 
 find_package(Vulkan REQUIRED COMPONENTS glslc)
 
@@ -20,8 +21,9 @@ foreach(SHADER IN LISTS sources_shaders)
     add_custom_command(
         OUTPUT "${SPV_FILE}"
         COMMAND "${CMAKE_COMMAND}" -E make_directory "${SPV_DIR}"
-        COMMAND "${Vulkan_GLSLC_EXECUTABLE}" "${SHADER}" -o "${SPV_FILE}"
+        COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -I "${CMAKE_CURRENT_SOURCE_DIR}/res/shaders" "${SHADER}" -o "${SPV_FILE}"
         MAIN_DEPENDENCY "${SHADER}"
+        DEPENDS ${shader_includes}
         COMMENT "Compiling ${SHADER_REL} to SPIR-V"
         VERBATIM
     )

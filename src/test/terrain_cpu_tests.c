@@ -133,6 +133,119 @@ test_chunk_layout_origin_matches_world(void) {
     }
 }
 
+static void
+test_feature_packet_hash_is_chunk_local(void) {
+    TerrainRegionConfig base = terrain_default_region_config();
+    TerrainWorld world = {0};
+    terrain_world_init(&world, &base);
+    assert(terrain_world_add_feature(&world, (TerrainFeature) {
+        .type = TERRAIN_FEATURE_PEAK,
+        .region_id = 0u,
+        .position = {8.0f, 0.0f, 8.0f},
+        .direction = {1.0f, 0.0f, 0.0f},
+        .intensity = 10.0f,
+        .sharpness = 0.5f,
+    }));
+
+    TerrainFieldPacket near_a = {0};
+    TerrainFieldPacket far_a = {0};
+    assert(terrain_world_build_packet(&world, 0u, 0.0f, 0.0f, 24.0f, 24.0f, &near_a));
+    assert(terrain_world_build_packet(&world, 0u, 200.0f, 200.0f, 224.0f, 224.0f, &far_a));
+    assert(near_a.feature_count == 1u);
+    assert(far_a.feature_count == 0u);
+    const uint32_t near_hash_a = terrain_field_packet_hash(&near_a);
+    const uint32_t far_hash_a = terrain_field_packet_hash(&far_a);
+
+    assert(terrain_world_add_feature(&world, (TerrainFeature) {
+        .type = TERRAIN_FEATURE_PEAK,
+        .region_id = 0u,
+        .position = {210.0f, 0.0f, 210.0f},
+        .direction = {1.0f, 0.0f, 0.0f},
+        .intensity = 6.0f,
+        .sharpness = 0.5f,
+    }));
+    TerrainFieldPacket near_b = {0};
+    TerrainFieldPacket far_b = {0};
+    assert(terrain_world_build_packet(&world, 0u, 0.0f, 0.0f, 24.0f, 24.0f, &near_b));
+    assert(terrain_world_build_packet(&world, 0u, 200.0f, 200.0f, 224.0f, 224.0f, &far_b));
+    assert(terrain_field_packet_hash(&near_b) == near_hash_a);
+    assert(terrain_field_packet_hash(&far_b) != far_hash_a);
+}
+
+static void
+test_feature_packet_bounds_are_local(void) {
+    TerrainRegionConfig base = terrain_default_region_config();
+    TerrainWorld world = {0};
+    terrain_world_init(&world, &base);
+    assert(terrain_world_add_feature(&world, (TerrainFeature) {
+        .type = TERRAIN_FEATURE_PEAK,
+        .region_id = 0u,
+        .position = {10.0f, 0.0f, 10.0f},
+        .direction = {1.0f, 0.0f, 0.0f},
+        .intensity = 20.0f,
+        .sharpness = 0.25f,
+    }));
+
+    TerrainFieldPacket near_packet = {0};
+    TerrainFieldPacket far_packet = {0};
+    assert(terrain_world_build_packet(&world, 0u, 0.0f, 0.0f, 24.0f, 24.0f, &near_packet));
+    assert(terrain_world_build_packet(&world, 0u, 200.0f, 200.0f, 224.0f, 224.0f, &far_packet));
+    const TerrainHeightBounds near_bounds = terrain_field_packet_snap_height_bounds(&near_packet);
+    const TerrainHeightBounds far_bounds = terrain_field_packet_snap_height_bounds(&far_packet);
+    assert(near_bounds.max_y > far_bounds.max_y);
+    assert(far_bounds.max_y == terrain_field_packet_snap_height_bounds(&(TerrainFieldPacket){.base = base}).max_y);
+}
+
+static void
+test_feature_packet_overflow_reports(void) {
+    TerrainRegionConfig base = terrain_default_region_config();
+    TerrainWorld world = {0};
+    terrain_world_init(&world, &base);
+    for (uint32_t i = 0u; i < TERRAIN_MAX_ACTIVE_FEATURES + 2u; i += 1u) {
+        assert(terrain_world_add_feature(&world, (TerrainFeature) {
+            .type = TERRAIN_FEATURE_PEAK,
+            .region_id = 0u,
+            .position = {12.0f, 0.0f, 12.0f},
+            .direction = {1.0f, 0.0f, 0.0f},
+            .intensity = 1.0f,
+            .sharpness = 0.2f,
+        }));
+    }
+    TerrainFieldPacket packet = {0};
+    assert(!terrain_world_build_packet(&world, 0u, 0.0f, 0.0f, 24.0f, 24.0f, &packet));
+    assert(packet.feature_count == TERRAIN_MAX_ACTIVE_FEATURES);
+    assert(packet.overflow_count == 2u);
+}
+
+static void
+test_feature_evaluation_peak_and_box_cut(void) {
+    TerrainRegionConfig base = terrain_default_region_config();
+    base.noise_amplitude = 0.0f;
+    base.base_height = 0.0f;
+    TerrainWorld world = {0};
+    terrain_world_init(&world, &base);
+    assert(terrain_world_add_feature(&world, (TerrainFeature) {
+        .type = TERRAIN_FEATURE_PEAK,
+        .region_id = 0u,
+        .position = {0.0f, 0.0f, 0.0f},
+        .direction = {1.0f, 0.0f, 0.0f},
+        .intensity = 8.0f,
+        .sharpness = 0.4f,
+    }));
+    assert(terrain_world_add_feature(&world, (TerrainFeature) {
+        .type = TERRAIN_FEATURE_BOX_CUT,
+        .region_id = 0u,
+        .position = {0.0f, 2.0f, 0.0f},
+        .extent = {3.0f, 3.0f, 3.0f},
+        .direction = {1.0f, 0.0f, 0.0f},
+        .influence_radius = 6.0f,
+    }));
+    TerrainFieldPacket packet = {0};
+    assert(terrain_world_build_packet(&world, 0u, -4.0f, -4.0f, 4.0f, 4.0f, &packet));
+    assert(terrain_field_density_sample(&packet, 0.0f, 7.0f, 0.0f) < 0.0f);
+    assert(terrain_field_density_sample(&packet, 0.0f, 2.0f, 0.0f) > 0.0f);
+}
+
 int
 main(void) {
     test_snapped_bounds();
@@ -142,5 +255,9 @@ main(void) {
     test_cpu_hermite_flat_cell();
     test_sparse_grid_chunk_halo_dims();
     test_chunk_layout_origin_matches_world();
+    test_feature_packet_hash_is_chunk_local();
+    test_feature_packet_bounds_are_local();
+    test_feature_packet_overflow_reports();
+    test_feature_evaluation_peak_and_box_cut();
     return 0;
 }

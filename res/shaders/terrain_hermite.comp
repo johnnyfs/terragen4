@@ -1,4 +1,5 @@
 #version 460
+#extension GL_GOOGLE_include_directive : require
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
@@ -8,10 +9,14 @@ layout(std140, set = 2, binding = 0) uniform TerrainParams {
     vec4 noise;    // cell_size, noise_freq, noise_amp, base_height
     vec4 field;    // warp_amount, warp_freq, lacunarity, gain
     vec4 chunk;    // origin_x, origin_y, origin_z, skirt_depth
-    ivec4 lmin;    // local_min_x, local_min_z, region_id, peak_count
+    ivec4 lmin;    // local_min_x, local_min_z, region_id, feature_count
     ivec4 omin;    // owned_min_x, owned_min_y, owned_min_z, _
     ivec4 odim;    // owned_dim_x, owned_dim_y, owned_dim_z, _
-    vec4 peaks[16]; // pos_x, pos_z, intensity, sharpness
+    ivec4 feature_meta[16]; // type, region, priority, min_lod
+    vec4 feature_data0[16]; // pos_x, pos_y, pos_z, radius
+    vec4 feature_data1[16]; // extent_x, extent_y, extent_z, intensity
+    vec4 feature_data2[16]; // dir_x, dir_y, dir_z, sharpness
+    vec4 feature_data3[16]; // falloff, material, _, _
 } params;
 
 struct CellSamples {
@@ -40,92 +45,7 @@ const uvec2 edges[12] = uvec2[12](
     uvec2(0u, 4u), uvec2(1u, 5u), uvec2(2u, 6u), uvec2(3u, 7u)
 );
 
-uint hash_u32(uint x) {
-    x ^= x >> 16u;
-    x *= 0x7feb352du;
-    x ^= x >> 15u;
-    x *= 0x846ca68bu;
-    x ^= x >> 16u;
-    return x;
-}
-
-float value_noise(uint seed, int x, int y, int z) {
-    uint h = seed;
-    h ^= hash_u32(uint(x) + 0x9e3779b9u);
-    h ^= hash_u32(uint(y) + 0xc2b2ae35u);
-    h ^= hash_u32(uint(z) + 0x85ebca6bu);
-    h = hash_u32(h);
-    return (float(h & 0x00ffffffu) / float(0x00ffffffu)) * 2.0 - 1.0;
-}
-
-float noise3(vec3 p, uint seed_offset) {
-    ivec3 p0 = ivec3(floor(p));
-    vec3 f = smoothstep(vec3(0.0), vec3(1.0), fract(p));
-    uint seed = uint(params.bounds.z) + seed_offset;
-
-    float c000 = value_noise(seed, p0.x, p0.y, p0.z);
-    float c100 = value_noise(seed, p0.x + 1, p0.y, p0.z);
-    float c010 = value_noise(seed, p0.x, p0.y + 1, p0.z);
-    float c110 = value_noise(seed, p0.x + 1, p0.y + 1, p0.z);
-    float c001 = value_noise(seed, p0.x, p0.y, p0.z + 1);
-    float c101 = value_noise(seed, p0.x + 1, p0.y, p0.z + 1);
-    float c011 = value_noise(seed, p0.x, p0.y + 1, p0.z + 1);
-    float c111 = value_noise(seed, p0.x + 1, p0.y + 1, p0.z + 1);
-
-    float x00 = mix(c000, c100, f.x);
-    float x10 = mix(c010, c110, f.x);
-    float x01 = mix(c001, c101, f.x);
-    float x11 = mix(c011, c111, f.x);
-    float y0 = mix(x00, x10, f.y);
-    float y1 = mix(x01, x11, f.y);
-    return mix(y0, y1, f.z);
-}
-
-float fbm3(vec3 p) {
-    float sum = 0.0;
-    float amplitude = 1.0;
-    float frequency = params.noise.y;
-    float normalizer = 0.0;
-    int octaves = clamp(params.bounds.w, 1, 6);
-
-    for (int i = 0; i < octaves; i += 1) {
-        sum += noise3(p * frequency, uint(i) * 101u) * amplitude;
-        normalizer += amplitude;
-        frequency *= params.field.z;
-        amplitude *= params.field.w;
-    }
-    return normalizer > 0.0 ? sum / normalizer : 0.0;
-}
-
-float sample_sdf(vec3 p) {
-    vec3 warp = vec3(
-        noise3(p * params.field.y, 311u),
-        noise3(p * params.field.y, 719u),
-        noise3(p * params.field.y, 1201u)
-    ) * params.field.x;
-    vec3 q = p + warp;
-
-    float broad = noise3(vec3(q.x * params.noise.y * 0.38, 0.0, q.z * params.noise.y * 0.38), 0u);
-    float detail = fbm3(q);
-    float ridge = (1.0 - abs(fbm3(q * vec3(1.0, 0.7, 1.0) + vec3(53.0, 0.0, -29.0)))) * 2.0 - 1.0;
-    float displacement = params.noise.z * (broad * 0.55 + detail * 0.30 + ridge * 0.15);
-
-    // Peaks add height (subtract from the SDF) with exponential falloff in the
-    // un-warped XZ plane, so each peak sits exactly at its defined position.
-    float peak_sum = 0.0;
-    uint peak_count = uint(params.lmin.w);
-    for (uint i = 0u; i < peak_count; i += 1u) {
-        float dist = length(p.xz - params.peaks[i].xy);
-        // Round the apex over a radius proportional to the peak width
-        // (1/sharpness) so the tip is smooth rather than a sharp cone point,
-        // while the exponential flanks are preserved.
-        float round_r = 0.5 / max(params.peaks[i].w, 1e-4);
-        float soft = sqrt(dist * dist + round_r * round_r) - round_r;
-        peak_sum += params.peaks[i].z * exp(-params.peaks[i].w * soft);
-    }
-
-    return p.y - params.noise.w - displacement - peak_sum;
-}
+#include "terrain_field.glsl"
 
 vec3 density_normal(vec3 p) {
     float e = max(params.noise.x * 0.5, 0.05);

@@ -16,7 +16,7 @@ typedef struct TerrainMeshVertex {
 } TerrainMeshVertex;
 
 typedef struct TerrainGpuPipeline {
-    TerrainRegionConfig config;
+    TerrainFieldPacket field_packet;
     ChunkLayout layout;
     uint32_t seam_mask;   /* which borders need transition/skirt geometry */
     uint32_t cell_count;
@@ -36,7 +36,7 @@ typedef struct TerrainGpuPipeline {
 
 bool terrain_gpu_init(
     SDL_GPUDevice *device,
-    const TerrainRegionConfig *config,
+    const TerrainFieldPacket *packet,
     const SparseGrid *grid,
     const ChunkLayout *layout,
     TerrainGpuPipeline *pipeline
@@ -48,7 +48,7 @@ bool terrain_gpu_init(
  * all chunks at a given LOD share identical local coordinates, so only the
  * per-chunk origin (a uniform) differs. Returns false if sizes mismatch.
  */
-bool terrain_gpu_reuse(TerrainGpuPipeline *pipeline, const TerrainRegionConfig *config, const ChunkLayout *layout, uint32_t cell_count);
+bool terrain_gpu_reuse(TerrainGpuPipeline *pipeline, const TerrainFieldPacket *packet, const ChunkLayout *layout, uint32_t cell_count);
 
 void terrain_gpu_generate(SDL_GPUCommandBuffer *command_buffer, TerrainGpuPipeline *pipeline);
 void terrain_gpu_render(SDL_GPURenderPass *render_pass, TerrainGpuPipeline *pipeline);
