@@ -172,7 +172,7 @@ mat4_perspective(float fovy_radians, float aspect, float near_z, float far_z, fl
     const float f = 1.0f / tanf(fovy_radians * 0.5f);
     SDL_memset(out, 0, sizeof(float) * 16u);
     out[0] = f / aspect;
-    out[5] = -f;
+    out[5] = f;
     out[10] = far_z / (near_z - far_z);
     out[11] = -1.0f;
     out[14] = (near_z * far_z) / (near_z - far_z);
