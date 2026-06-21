@@ -3,6 +3,23 @@
 
 #include <stdint.h>
 
+/* Maximum number of peak features per region. Peaks ride in the per-chunk GPU
+ * uniform push (a fixed-size vec4 array), so this cap is bounded by uniform
+ * size; bump it here and in the matching shader arrays if it needs to grow. */
+#define TERRAIN_MAX_PEAKS 16
+
+/*
+ * A peak feature: a point that adds height to the terrain SDF, falling off
+ * exponentially with horizontal (XZ) distance from its centre:
+ *   added_height = intensity * exp(-sharpness * dist_xz)
+ */
+typedef struct TerrainPeak {
+    float pos_x;
+    float pos_z;
+    float intensity;   /* height added at the centre */
+    float sharpness;   /* exponential decay rate; larger = steeper/narrower */
+} TerrainPeak;
+
 typedef struct TerrainRegionConfig {
     uint32_t size_x;
     uint32_t size_z;
@@ -18,6 +35,8 @@ typedef struct TerrainRegionConfig {
     float noise_lacunarity;
     float noise_gain;
     uint32_t noise_octaves;
+    uint32_t peak_count;
+    TerrainPeak peaks[TERRAIN_MAX_PEAKS];
 } TerrainRegionConfig;
 
 typedef struct TerrainHeightBounds {
