@@ -113,12 +113,18 @@ make_params(const TerrainGpuPipeline *pipeline) {
             layout->origin_x,
             layout->origin_y,
             layout->origin_z,
-            /* Skirt depth scales with cell size so it spans the vertical mismatch
-             * at a one-LOD transition (the coarser neighbour's cells are 2x). */
-            layout->cell_size * 4.0f,
+            /* Skirt depth only matters where a border is a transition; size it to
+             * the coarser neighbour's cells (2x this LOD) with headroom. Zero when
+             * this chunk has no transition borders. */
+            pipeline->seam_mask != 0u ? layout->cell_size * 8.0f : 0.0f,
         },
         .lmin = {layout->local_min_x, layout->local_min_z, 0, 0},
-        .omin = {layout->owned_min_x, layout->owned_min_y, layout->owned_min_z, 0},
+        .omin = {
+            layout->owned_min_x,
+            layout->owned_min_y,
+            layout->owned_min_z,
+            (int32_t)pipeline->seam_mask,
+        },
         .odim = {layout->owned_dim_x, layout->owned_dim_y, layout->owned_dim_z, 0},
     };
 }

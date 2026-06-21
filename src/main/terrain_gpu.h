@@ -18,6 +18,7 @@ typedef struct TerrainMeshVertex {
 typedef struct TerrainGpuPipeline {
     TerrainRegionConfig config;
     ChunkLayout layout;
+    uint32_t seam_mask;   /* which borders need transition/skirt geometry */
     uint32_t cell_count;
     uint32_t max_vertices;
 

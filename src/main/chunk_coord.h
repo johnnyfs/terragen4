@@ -50,9 +50,18 @@ typedef struct ChunkAabb2 {
     float max_z;
 } ChunkAabb2;
 
+/* Border bits for ChunkGenKey.seam_mask: set when that border faces a
+ * different-LOD neighbour (and so needs transition/skirt geometry). */
+#define CHUNK_SEAM_NEG_X 0x1u
+#define CHUNK_SEAM_POS_X 0x2u
+#define CHUNK_SEAM_NEG_Z 0x4u
+#define CHUNK_SEAM_POS_Z 0x8u
+
 /*
  * Stable generation key for a chunk. region_id is reserved so a future region
  * graph can add per-region dependency keys without reshaping this struct.
+ * seam_mask captures which borders face a different LOD, so a chunk's seam
+ * geometry is part of its cached identity (only ring-boundary chunks change it).
  */
 typedef struct ChunkGenKey {
     uint32_t region_id;
@@ -62,6 +71,7 @@ typedef struct ChunkGenKey {
     uint32_t density_version;
     uint32_t mesh_version;
     uint32_t material_version;
+    uint32_t seam_mask;
 } ChunkGenKey;
 
 /* Per-LOD scale. */
@@ -110,6 +120,14 @@ uint32_t chunk_genkey_hash(const ChunkGenKey *key);
  */
 /* Distance below which a LOD-`lod` chunk is refined into its finer children. */
 float chunk_refine_threshold(uint32_t lod);
+
+/*
+ * Compute the seam mask for keys[index] by probing just outside each of its four
+ * XZ borders against the active set (a gap-free partition). A border bit is set
+ * iff the covering neighbour exists and has a different LOD. Region/clip edges
+ * (no neighbour) are intentionally left unset.
+ */
+uint32_t chunk_seam_mask(const ChunkGenKey *keys, size_t count, size_t index);
 
 /*
  * Multi-LOD active set via a restricted quadtree clipmap: coarse chunks near the

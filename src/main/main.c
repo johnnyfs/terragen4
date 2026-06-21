@@ -846,6 +846,10 @@ generate_chunk(AppState *state, SDL_GPUCommandBuffer *command_buffer, ChunkRecor
         }
     }
 
+    /* Seam geometry depends on neighbour LODs; it is part of the chunk's key, so
+     * set it after reuse/init (both of which leave it untouched / zeroed). */
+    pipe->seam_mask = rec->key.seam_mask;
+
     rec->mem_estimate =
         (size_t)cell_count * (sizeof(SparseGridCoord) + 96u) +
         (size_t)pipe->max_vertices * sizeof(TerrainMeshVertex);
@@ -872,6 +876,13 @@ chunk_system_update(AppState *state) {
         pov_x, pov_z, CHUNK_REGION_TEST,
         state->density_version, 1u, 1u, state->active_keys, CHUNK_MAX_ACTIVE
     );
+
+    /* Resolve per-chunk seam masks from neighbour LODs before any cache lookup,
+     * so the mask is part of each chunk's identity. */
+    for (size_t i = 0u; i < state->active_count; i += 1u) {
+        state->active_keys[i].seam_mask =
+            chunk_seam_mask(state->active_keys, state->active_count, i);
+    }
 
     state->dbg_active = (uint32_t)state->active_count;
     state->dbg_hits = 0u;

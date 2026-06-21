@@ -252,6 +252,78 @@ test_active_set_core_is_finest_and_stable(void) {
     }
 }
 
+static int
+find_cover(const ChunkGenKey *keys, size_t n, float px, float pz, size_t skip) {
+    for (size_t j = 0u; j < n; j += 1u) {
+        if (j == skip) {
+            continue;
+        }
+        const ChunkCoord c = {.cx = keys[j].cx, .cz = keys[j].cz, .lod = keys[j].lod};
+        const ChunkAabb2 b = chunk_bounds(c);
+        if (px >= b.min_x && px < b.max_x && pz >= b.min_z && pz < b.max_z) {
+            return (int)j;
+        }
+    }
+    return -1;
+}
+
+static void
+test_seam_mask(void) {
+    const float pov = chunk_region_extent() * 0.5f;
+    ChunkGenKey keys[4096];
+    const size_t n = chunk_active_set(pov, pov, CHUNK_REGION_TEST, 1u, 1u, 1u, keys, 4096u);
+    assert(n > 0u);
+
+    uint32_t masks[4096];
+    for (size_t i = 0u; i < n; i += 1u) {
+        masks[i] = chunk_seam_mask(keys, n, i);
+    }
+
+    /* The chunk under the POV is LOD0 surrounded by LOD0 -> no transitions. */
+    const int home = find_cover(keys, n, pov, pov, (size_t)-1);
+    assert(home >= 0 && keys[home].lod == 0u && masks[home] == 0u);
+
+    /* The clipmap has LOD rings, so some chunk must carry a transition bit. */
+    bool any_transition = false;
+    for (size_t i = 0u; i < n; i += 1u) {
+        if (masks[i] != 0u) {
+            any_transition = true;
+        }
+    }
+    assert(any_transition);
+
+    /* Per-border correctness + symmetry: a set bit implies a different-LOD
+     * neighbour that marks the shared border back; an unset bit implies no
+     * neighbour or a same-LOD neighbour. */
+    const float eps = chunk_world_size(0u) * 0.25f;
+    for (size_t i = 0u; i < n; i += 1u) {
+        const ChunkCoord c = {.cx = keys[i].cx, .cz = keys[i].cz, .lod = keys[i].lod};
+        const ChunkAabb2 b = chunk_bounds(c);
+        const float mx = (b.min_x + b.max_x) * 0.5f;
+        const float mz = (b.min_z + b.max_z) * 0.5f;
+        const float px[4] = {b.min_x - eps, b.max_x + eps, mx, mx};
+        const float pz[4] = {mz, mz, b.min_z - eps, b.max_z + eps};
+        const uint32_t self_bit[4] = {CHUNK_SEAM_NEG_X, CHUNK_SEAM_POS_X, CHUNK_SEAM_NEG_Z, CHUNK_SEAM_POS_Z};
+        const uint32_t nb_bit[4] = {CHUNK_SEAM_POS_X, CHUNK_SEAM_NEG_X, CHUNK_SEAM_POS_Z, CHUNK_SEAM_NEG_Z};
+        for (int k = 0; k < 4; k += 1) {
+            const int j = find_cover(keys, n, px[k], pz[k], i);
+            if (masks[i] & self_bit[k]) {
+                assert(j >= 0);
+                assert(keys[j].lod != keys[i].lod);
+                assert(masks[j] & nb_bit[k]); /* symmetry */
+            } else if (j >= 0) {
+                assert(keys[j].lod == keys[i].lod);
+            }
+        }
+    }
+
+    /* seam_mask participates in identity. */
+    ChunkGenKey a = keys[home];
+    ChunkGenKey b2 = a;
+    b2.seam_mask = CHUNK_SEAM_POS_X;
+    assert(!chunk_genkey_equals(&a, &b2));
+}
+
 static void
 test_active_set_multilod_in_region(void) {
     /* Even at a region corner, no active chunk falls outside the finite region. */
@@ -278,5 +350,6 @@ main(void) {
     test_active_set_neighbor_lod_within_one();
     test_active_set_core_is_finest_and_stable();
     test_active_set_multilod_in_region();
+    test_seam_mask();
     return 0;
 }

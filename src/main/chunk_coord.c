@@ -127,7 +127,8 @@ chunk_genkey_equals(const ChunkGenKey *a, const ChunkGenKey *b) {
            a->lod == b->lod &&
            a->density_version == b->density_version &&
            a->mesh_version == b->mesh_version &&
-           a->material_version == b->material_version;
+           a->material_version == b->material_version &&
+           a->seam_mask == b->seam_mask;
 }
 
 uint32_t
@@ -141,7 +142,43 @@ chunk_genkey_hash(const ChunkGenKey *key) {
     h ^= terrain_hash_u32(key->density_version + 0x165667b1u);
     h ^= terrain_hash_u32(key->mesh_version + 0xd3a2646cu);
     h ^= terrain_hash_u32(key->material_version + 0xfd7046c5u);
+    h ^= terrain_hash_u32(key->seam_mask + 0xb5297a4du);
     return terrain_hash_u32(h);
+}
+
+uint32_t
+chunk_seam_mask(const ChunkGenKey *keys, size_t count, size_t index) {
+    const ChunkGenKey self = keys[index];
+    const ChunkCoord c = {.cx = self.cx, .cz = self.cz, .lod = self.lod};
+    const ChunkAabb2 b = chunk_bounds(c);
+    const float mid_x = (b.min_x + b.max_x) * 0.5f;
+    const float mid_z = (b.min_z + b.max_z) * 0.5f;
+    /* Probe just outside each border; small relative to the finest chunk so it
+     * always lands inside the adjacent chunk. */
+    const float eps = chunk_world_size(0u) * 0.25f;
+
+    const float probe_x[4] = {b.min_x - eps, b.max_x + eps, mid_x, mid_x};
+    const float probe_z[4] = {mid_z, mid_z, b.min_z - eps, b.max_z + eps};
+    const uint32_t bits[4] = {CHUNK_SEAM_NEG_X, CHUNK_SEAM_POS_X, CHUNK_SEAM_NEG_Z, CHUNK_SEAM_POS_Z};
+
+    uint32_t mask = 0u;
+    for (uint32_t side = 0u; side < 4u; side += 1u) {
+        for (size_t j = 0u; j < count; j += 1u) {
+            if (j == index || keys[j].region_id != self.region_id) {
+                continue;
+            }
+            const ChunkCoord oc = {.cx = keys[j].cx, .cz = keys[j].cz, .lod = keys[j].lod};
+            const ChunkAabb2 ob = chunk_bounds(oc);
+            if (probe_x[side] >= ob.min_x && probe_x[side] < ob.max_x &&
+                probe_z[side] >= ob.min_z && probe_z[side] < ob.max_z) {
+                if (keys[j].lod != self.lod) {
+                    mask |= bits[side];
+                }
+                break; /* partition: exactly one chunk covers the probe */
+            }
+        }
+    }
+    return mask;
 }
 
 float
