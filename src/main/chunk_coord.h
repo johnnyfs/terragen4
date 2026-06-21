@@ -50,9 +50,21 @@ typedef struct ChunkAabb2 {
     float max_z;
 } ChunkAabb2;
 
+/* Border bits for ChunkGenKey.seam_mask: set when that border faces a
+ * different-LOD neighbour (and so needs transition/skirt geometry). */
+#define CHUNK_SEAM_NEG_X 0x1u
+#define CHUNK_SEAM_POS_X 0x2u
+#define CHUNK_SEAM_NEG_Z 0x4u
+#define CHUNK_SEAM_POS_Z 0x8u
+
 /*
  * Stable generation key for a chunk. region_id is reserved so a future region
  * graph can add per-region dependency keys without reshaping this struct.
+ *
+ * Note: the seam mask is deliberately NOT part of identity. Neighbour LODs
+ * change continuously as the POV moves; keying on them would make boundary
+ * chunks miss the cache and blink out while regenerating. Instead the mask is
+ * tracked per cache record and the chunk's skirts are refreshed in place.
  */
 typedef struct ChunkGenKey {
     uint32_t region_id;
@@ -112,6 +124,14 @@ uint32_t chunk_genkey_hash(const ChunkGenKey *key);
 float chunk_refine_threshold(uint32_t lod);
 
 /*
+ * Compute the seam mask for keys[index] by probing just outside each of its four
+ * XZ borders against the active set (a gap-free partition). A border bit is set
+ * iff the covering neighbour exists and has a different LOD. Region/clip edges
+ * (no neighbour) are intentionally left unset.
+ */
+uint32_t chunk_seam_mask(const ChunkGenKey *keys, size_t count, size_t index);
+
+/*
  * Multi-LOD active set via a restricted quadtree clipmap: coarse chunks near the
  * POV are recursively refined into finer children, so coverage is gap-free,
  * each world point is owned by exactly one LOD, and edge-adjacent visible chunks
@@ -127,6 +147,25 @@ size_t chunk_active_set(
     uint32_t material_version,
     ChunkGenKey *out_keys,
     size_t out_capacity
+);
+
+/*
+ * Same as chunk_active_set but with LOD hysteresis: pass the previous frame's
+ * active leaves and a dead-band fraction so chunks near a band boundary do not
+ * oscillate LOD frame-to-frame. (chunk_active_set is this with prev=NULL, 0.)
+ */
+size_t chunk_active_set_hyst(
+    float pov_x,
+    float pov_z,
+    uint32_t region_id,
+    uint32_t density_version,
+    uint32_t mesh_version,
+    uint32_t material_version,
+    ChunkGenKey *out_keys,
+    size_t out_capacity,
+    const ChunkGenKey *prev_keys,
+    size_t prev_count,
+    float hysteresis
 );
 
 size_t chunk_active_set_single_lod(

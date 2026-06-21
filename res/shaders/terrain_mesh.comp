@@ -175,14 +175,25 @@ void emit_skirt(vec3 p, vec3 n, vec4 color, vec3 tangent, float half_width, floa
     vertex_buffer.vertices[base + 5u] = vd;
 }
 
+/* seam_mask bits (must match chunk_coord.h CHUNK_SEAM_*). */
+const int SEAM_NEG_X = 0x1;
+const int SEAM_POS_X = 0x2;
+const int SEAM_NEG_Z = 0x4;
+const int SEAM_POS_Z = 0x8;
+
 void emit_border_skirts(ivec3 c) {
+    int seam = params.omin.w;
     float depth = params.chunk.w;
-    if (depth <= 0.0) {
+    if (seam == 0 || depth <= 0.0) {
         return;
     }
-    bool bx = (c.x == params.omin.x) || (c.x == params.omin.x + params.odim.x - 1);
-    bool bz = (c.z == params.omin.z) || (c.z == params.omin.z + params.odim.z - 1);
-    if (!bx && !bz) {
+    /* Skirt a border only where it faces a different-LOD neighbour. Same-LOD
+     * borders are crack-free via the shared halo, so they get nothing. */
+    bool nx = (c.x == params.omin.x) && ((seam & SEAM_NEG_X) != 0);
+    bool px = (c.x == params.omin.x + params.odim.x - 1) && ((seam & SEAM_POS_X) != 0);
+    bool nz = (c.z == params.omin.z) && ((seam & SEAM_NEG_Z) != 0);
+    bool pz = (c.z == params.omin.z + params.odim.z - 1) && ((seam & SEAM_POS_Z) != 0);
+    if (!nx && !px && !nz && !pz) {
         return;
     }
     HermiteCell self;
@@ -193,10 +204,10 @@ void emit_border_skirts(ivec3 c) {
     vec3 n = normalize(self.normal_crossings.xyz);
     vec4 color = terrain_color(p.y, n);
     float half_width = params.noise.x * 0.5;
-    if (bx) {
+    if (nx || px) {
         emit_skirt(p, n, color, vec3(0.0, 0.0, 1.0), half_width, depth);
     }
-    if (bz) {
+    if (nz || pz) {
         emit_skirt(p, n, color, vec3(1.0, 0.0, 0.0), half_width, depth);
     }
 }

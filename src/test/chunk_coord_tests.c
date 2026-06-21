@@ -252,6 +252,143 @@ test_active_set_core_is_finest_and_stable(void) {
     }
 }
 
+static int
+find_cover(const ChunkGenKey *keys, size_t n, float px, float pz, size_t skip) {
+    for (size_t j = 0u; j < n; j += 1u) {
+        if (j == skip) {
+            continue;
+        }
+        const ChunkCoord c = {.cx = keys[j].cx, .cz = keys[j].cz, .lod = keys[j].lod};
+        const ChunkAabb2 b = chunk_bounds(c);
+        if (px >= b.min_x && px < b.max_x && pz >= b.min_z && pz < b.max_z) {
+            return (int)j;
+        }
+    }
+    return -1;
+}
+
+static void
+test_seam_mask(void) {
+    const float pov = chunk_region_extent() * 0.5f;
+    ChunkGenKey keys[4096];
+    const size_t n = chunk_active_set(pov, pov, CHUNK_REGION_TEST, 1u, 1u, 1u, keys, 4096u);
+    assert(n > 0u);
+
+    uint32_t masks[4096];
+    for (size_t i = 0u; i < n; i += 1u) {
+        masks[i] = chunk_seam_mask(keys, n, i);
+    }
+
+    /* The chunk under the POV is LOD0 surrounded by LOD0 -> no transitions. */
+    const int home = find_cover(keys, n, pov, pov, (size_t)-1);
+    assert(home >= 0 && keys[home].lod == 0u && masks[home] == 0u);
+
+    /* The clipmap has LOD rings, so some chunk must carry a transition bit. */
+    bool any_transition = false;
+    for (size_t i = 0u; i < n; i += 1u) {
+        if (masks[i] != 0u) {
+            any_transition = true;
+        }
+    }
+    assert(any_transition);
+
+    /* Per-border correctness + symmetry: a set bit implies a different-LOD
+     * neighbour that marks the shared border back; an unset bit implies no
+     * neighbour or a same-LOD neighbour. */
+    const float eps = chunk_world_size(0u) * 0.25f;
+    for (size_t i = 0u; i < n; i += 1u) {
+        const ChunkCoord c = {.cx = keys[i].cx, .cz = keys[i].cz, .lod = keys[i].lod};
+        const ChunkAabb2 b = chunk_bounds(c);
+        const float mx = (b.min_x + b.max_x) * 0.5f;
+        const float mz = (b.min_z + b.max_z) * 0.5f;
+        const float px[4] = {b.min_x - eps, b.max_x + eps, mx, mx};
+        const float pz[4] = {mz, mz, b.min_z - eps, b.max_z + eps};
+        const uint32_t self_bit[4] = {CHUNK_SEAM_NEG_X, CHUNK_SEAM_POS_X, CHUNK_SEAM_NEG_Z, CHUNK_SEAM_POS_Z};
+        const uint32_t nb_bit[4] = {CHUNK_SEAM_POS_X, CHUNK_SEAM_NEG_X, CHUNK_SEAM_POS_Z, CHUNK_SEAM_NEG_Z};
+        for (int k = 0; k < 4; k += 1) {
+            const int j = find_cover(keys, n, px[k], pz[k], i);
+            if (masks[i] & self_bit[k]) {
+                assert(j >= 0);
+                assert(keys[j].lod != keys[i].lod);
+                assert(masks[j] & nb_bit[k]); /* symmetry */
+            } else if (j >= 0) {
+                assert(keys[j].lod == keys[i].lod);
+            }
+        }
+    }
+}
+
+static bool
+key_sets_equal(const ChunkGenKey *a, size_t na, const ChunkGenKey *b, size_t nb) {
+    if (na != nb) {
+        return false;
+    }
+    for (size_t i = 0u; i < na; i += 1u) {
+        bool found = false;
+        for (size_t j = 0u; j < nb; j += 1u) {
+            if (a[i].cx == b[j].cx && a[i].cz == b[j].cz && a[i].lod == b[j].lod) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void
+test_active_set_hysteresis(void) {
+    const float c = chunk_region_extent() * 0.5f;
+
+    /* Fixed point: feeding a stationary frame's own output as prev changes
+     * nothing. */
+    ChunkGenKey s[4096];
+    const size_t ns = chunk_active_set(c, c, CHUNK_REGION_TEST, 1u, 1u, 1u, s, 4096u);
+    ChunkGenKey s2[4096];
+    const size_t ns2 = chunk_active_set_hyst(c, c, CHUNK_REGION_TEST, 1u, 1u, 1u, s2, 4096u, s, ns, 0.2f);
+    assert(key_sets_equal(s, ns, s2, ns2));
+
+    /* Jitter the POV back and forth across ~half a LOD1 chunk. Hysteresis must
+     * suppress the per-step LOD flip-flop that the stateless selection shows. */
+    const float jitter = chunk_world_size(1u) * 0.5f;
+    int nohyst_changes = 0;
+    int hyst_changes = 0;
+    ChunkGenKey prev_n[4096];
+    size_t prev_n_count = 0u;
+    ChunkGenKey prev_h[4096];
+    size_t prev_h_count = 0u;
+    ChunkGenKey cur[4096];
+
+    for (int step = 0; step < 40; step += 1) {
+        const float px = c + ((step % 2 == 0) ? 0.0f : jitter);
+
+        const size_t nn = chunk_active_set(px, c, CHUNK_REGION_TEST, 1u, 1u, 1u, cur, 4096u);
+        if (step > 0 && !key_sets_equal(cur, nn, prev_n, prev_n_count)) {
+            nohyst_changes += 1;
+        }
+        for (size_t i = 0u; i < nn; i += 1u) {
+            prev_n[i] = cur[i];
+        }
+        prev_n_count = nn;
+
+        const size_t nh = chunk_active_set_hyst(
+            px, c, CHUNK_REGION_TEST, 1u, 1u, 1u, cur, 4096u, prev_h, prev_h_count, 0.2f
+        );
+        if (step > 0 && !key_sets_equal(cur, nh, prev_h, prev_h_count)) {
+            hyst_changes += 1;
+        }
+        for (size_t i = 0u; i < nh; i += 1u) {
+            prev_h[i] = cur[i];
+        }
+        prev_h_count = nh;
+    }
+
+    assert(nohyst_changes > 0);          /* the jitter really does provoke flips */
+    assert(hyst_changes < nohyst_changes); /* hysteresis suppresses them */
+}
+
 static void
 test_active_set_multilod_in_region(void) {
     /* Even at a region corner, no active chunk falls outside the finite region. */
@@ -278,5 +415,7 @@ main(void) {
     test_active_set_neighbor_lod_within_one();
     test_active_set_core_is_finest_and_stable();
     test_active_set_multilod_in_region();
+    test_seam_mask();
+    test_active_set_hysteresis();
     return 0;
 }

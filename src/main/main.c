@@ -36,6 +36,7 @@ typedef struct HudVertex {
 #define CHUNK_POOL_CAPACITY_DEFAULT 256u
 #define CHUNK_MAX_GEN_PER_FRAME 6u
 #define CHUNK_MAX_ACTIVE 4096u
+#define CHUNK_LOD_HYSTERESIS 0.2f  /* dead-band so LODs don't oscillate at a band */
 
 /* Camera modes the user TABs through. FREE is the original free-look camera. */
 typedef enum {
@@ -80,6 +81,8 @@ typedef struct AppState {
     uint32_t density_version;
     ChunkGenKey active_keys[CHUNK_MAX_ACTIVE];
     size_t active_count;
+    ChunkGenKey prev_active_keys[CHUNK_MAX_ACTIVE]; /* last frame, for LOD hysteresis */
+    size_t prev_active_count;
 
     /* Debug counters, refreshed each frame. */
     uint32_t dbg_active;
@@ -846,6 +849,10 @@ generate_chunk(AppState *state, SDL_GPUCommandBuffer *command_buffer, ChunkRecor
         }
     }
 
+    /* Seam geometry depends on neighbour LODs (tracked per record, not in the
+     * key); set it after reuse/init (both of which leave it untouched/zeroed). */
+    pipe->seam_mask = rec->seam_want;
+
     rec->mem_estimate =
         (size_t)cell_count * (sizeof(SparseGridCoord) + 96u) +
         (size_t)pipe->max_vertices * sizeof(TerrainMeshVertex);
@@ -868,9 +875,10 @@ chunk_system_update(AppState *state) {
      * exactly (so reverting a setting heals instantly), any change invalidates. */
     state->density_version = terrain_density_hash(&state->terrain_config);
 
-    state->active_count = chunk_active_set(
+    state->active_count = chunk_active_set_hyst(
         pov_x, pov_z, CHUNK_REGION_TEST,
-        state->density_version, 1u, 1u, state->active_keys, CHUNK_MAX_ACTIVE
+        state->density_version, 1u, 1u, state->active_keys, CHUNK_MAX_ACTIVE,
+        state->prev_active_keys, state->prev_active_count, CHUNK_LOD_HYSTERESIS
     );
 
     state->dbg_active = (uint32_t)state->active_count;
@@ -884,14 +892,22 @@ chunk_system_update(AppState *state) {
 
     for (size_t i = 0u; i < state->active_count; i += 1u) {
         const ChunkGenKey key = state->active_keys[i];
+        const uint32_t desired_seam = chunk_seam_mask(state->active_keys, state->active_count, i);
         if (key.lod < CHUNK_LOD_COUNT) {
             state->dbg_lod[key.lod] += 1u;
         }
         ChunkRecord *rec = chunk_cache_find(&state->chunk_cache, &key);
         if (rec != NULL) {
             rec->last_used_frame = state->frame_count;
+            rec->seam_want = desired_seam;
             if (rec->status == CHUNK_STATUS_READY) {
                 state->dbg_hits += 1u;
+                /* Neighbour LOD changed -> refresh skirts in place. The chunk
+                 * keeps rendering its current mesh until the refresh runs, so it
+                 * never blinks out (seams are not part of cache identity). */
+                if (rec->seam_built != desired_seam) {
+                    chunk_queue_push_if_absent(&state->chunk_cache, &key);
+                }
             }
             continue;
         }
@@ -916,6 +932,7 @@ chunk_system_update(AppState *state) {
         rec = chunk_cache_insert(&state->chunk_cache, &key, cx, cz);
         if (rec != NULL) {
             rec->last_used_frame = state->frame_count;
+            rec->seam_want = desired_seam;
             chunk_queue_push_if_absent(&state->chunk_cache, &key);
         }
     }
@@ -928,24 +945,38 @@ chunk_system_update(AppState *state) {
                 break;
             }
             ChunkRecord *rec = chunk_cache_find(&state->chunk_cache, &key);
-            if (rec == NULL || rec->status != CHUNK_STATUS_QUEUED) {
-                continue; /* evicted or already handled before generation ran */
+            if (rec == NULL) {
+                continue; /* evicted before generation ran */
             }
-            rec->status = CHUNK_STATUS_GENERATING;
+            const bool fresh = (rec->status == CHUNK_STATUS_QUEUED);
+            const bool refresh = (rec->status == CHUNK_STATUS_READY && rec->seam_built != rec->seam_want);
+            if (!fresh && !refresh) {
+                continue; /* already up to date or mid-flight */
+            }
+            if (fresh) {
+                rec->status = CHUNK_STATUS_GENERATING;
+            }
             if (generate_chunk(state, command_buffer, rec)) {
                 rec->status = CHUNK_STATUS_READY;
+                rec->seam_built = rec->seam_want;
                 state->dbg_generated += 1u;
                 state->dbg_generated_total += 1u;
-            } else {
+            } else if (fresh) {
                 rec->status = CHUNK_STATUS_FAILED;
                 state->dbg_failed += 1u;
             }
+            /* A failed refresh keeps the chunk READY with its prior mesh. */
         }
         SDL_SubmitGPUCommandBuffer(command_buffer);
     }
 
     state->dbg_resident = (uint32_t)chunk_cache_resident(&state->chunk_cache);
     state->dbg_queue = (uint32_t)chunk_queue_size(&state->chunk_cache);
+
+    /* Snapshot this frame's active leaves for next frame's LOD hysteresis. */
+    SDL_memcpy(state->prev_active_keys, state->active_keys,
+               state->active_count * sizeof(state->active_keys[0]));
+    state->prev_active_count = state->active_count;
 
     /* Periodic console summary so headless/smoke runs surface the same data. */
     if ((state->frame_count % 120u) == 0u) {
@@ -963,14 +994,63 @@ chunk_system_update(AppState *state) {
     }
 }
 
+/* Draw a chunk if it is resident and ready, deduped per frame. Returns true if
+ * the chunk's footprint is covered (drawn now or already drawn this frame). */
+static bool
+render_record(AppState *state, SDL_GPURenderPass *render_pass, const ChunkGenKey *key) {
+    ChunkRecord *rec = chunk_cache_find(&state->chunk_cache, key);
+    if (rec == NULL || rec->status != CHUNK_STATUS_READY) {
+        return false;
+    }
+    const uint64_t stamp = (uint64_t)state->frame_count + 1u; /* +1: never 0 */
+    if (rec->rendered_frame != stamp) {
+        terrain_gpu_render(render_pass, &state->chunk_pool[rec->slot]);
+        rec->rendered_frame = stamp;
+        state->dbg_rendered += 1u;
+    }
+    return true;
+}
+
+/* When an active chunk isn't ready yet, cover its footprint with the nearest
+ * resident-ready ancestor (the coarser chunk that was there before a refine)
+ * or, failing that, any ready children (the finer chunks from before a
+ * coarsen). This keeps LOD changes from blanking the area out. */
+static void
+render_coverage_fallback(AppState *state, SDL_GPURenderPass *render_pass, ChunkGenKey key) {
+    ChunkGenKey a = key;
+    while (a.lod + 1u < CHUNK_LOD_COUNT) {
+        a.cx /= 2;
+        a.cz /= 2;
+        a.lod += 1u;
+        if (render_record(state, render_pass, &a)) {
+            return;
+        }
+    }
+    if (key.lod > 0u) {
+        ChunkGenKey ch = key;
+        ch.lod = key.lod - 1u;
+        for (int32_t dz = 0; dz < 2; dz += 1) {
+            for (int32_t dx = 0; dx < 2; dx += 1) {
+                ch.cx = key.cx * 2 + dx;
+                ch.cz = key.cz * 2 + dz;
+                render_record(state, render_pass, &ch);
+            }
+        }
+    }
+}
+
 static void
 chunk_system_render(AppState *state, SDL_GPURenderPass *render_pass) {
     state->dbg_rendered = 0u;
+    /* Pass 1: every ready active chunk. */
+    for (size_t i = 0u; i < state->active_count; i += 1u) {
+        render_record(state, render_pass, &state->active_keys[i]);
+    }
+    /* Pass 2: cover not-ready active chunks with their resident LOD neighbours. */
     for (size_t i = 0u; i < state->active_count; i += 1u) {
         ChunkRecord *rec = chunk_cache_find(&state->chunk_cache, &state->active_keys[i]);
-        if (rec != NULL && rec->status == CHUNK_STATUS_READY) {
-            terrain_gpu_render(render_pass, &state->chunk_pool[rec->slot]);
-            state->dbg_rendered += 1u;
+        if (rec == NULL || rec->status != CHUNK_STATUS_READY) {
+            render_coverage_fallback(state, render_pass, state->active_keys[i]);
         }
     }
 }
