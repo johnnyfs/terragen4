@@ -149,6 +149,25 @@ size_t chunk_active_set(
     size_t out_capacity
 );
 
+/*
+ * Same as chunk_active_set but with LOD hysteresis: pass the previous frame's
+ * active leaves and a dead-band fraction so chunks near a band boundary do not
+ * oscillate LOD frame-to-frame. (chunk_active_set is this with prev=NULL, 0.)
+ */
+size_t chunk_active_set_hyst(
+    float pov_x,
+    float pov_z,
+    uint32_t region_id,
+    uint32_t density_version,
+    uint32_t mesh_version,
+    uint32_t material_version,
+    ChunkGenKey *out_keys,
+    size_t out_capacity,
+    const ChunkGenKey *prev_keys,
+    size_t prev_count,
+    float hysteresis
+);
+
 size_t chunk_active_set_single_lod(
     float pov_x,
     float pov_z,

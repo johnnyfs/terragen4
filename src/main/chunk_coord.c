@@ -196,14 +196,37 @@ typedef struct ActiveSetCtx {
     ChunkGenKey *out_keys;
     size_t out_capacity;
     size_t count;
+    const ChunkGenKey *prev;  /* last frame's active leaves, for hysteresis */
+    size_t prev_count;
+    float hysteresis;         /* dead-band fraction of the refine threshold */
 } ActiveSetCtx;
+
+static bool
+active_set_prev_was_leaf(const ActiveSetCtx *ctx, ChunkCoord c) {
+    for (size_t i = 0u; i < ctx->prev_count; i += 1u) {
+        if (ctx->prev[i].region_id == ctx->region_id &&
+            ctx->prev[i].cx == c.cx &&
+            ctx->prev[i].cz == c.cz &&
+            ctx->prev[i].lod == c.lod) {
+            return true;
+        }
+    }
+    return false;
+}
 
 static void
 active_set_emit_or_refine(ActiveSetCtx *ctx, ChunkCoord c) {
     if (!chunk_in_region(c)) {
         return;
     }
-    if (c.lod > 0u && chunk_distance_to_bounds(c, ctx->pov_x, ctx->pov_z) < chunk_refine_threshold(c.lod)) {
+    /* Hysteresis: a node that was already a leaf at this LOD resists refining
+     * (must come closer), and a node that was finer resists coarsening (can go
+     * farther) — a dead-band that stops chunks oscillating LOD at a boundary. */
+    float cut = chunk_refine_threshold(c.lod);
+    if (ctx->prev != NULL && ctx->hysteresis > 0.0f) {
+        cut *= active_set_prev_was_leaf(ctx, c) ? (1.0f - ctx->hysteresis) : (1.0f + ctx->hysteresis);
+    }
+    if (c.lod > 0u && chunk_distance_to_bounds(c, ctx->pov_x, ctx->pov_z) < cut) {
         const uint32_t child_lod = c.lod - 1u;
         for (int32_t dz = 0; dz < 2; dz += 1) {
             for (int32_t dx = 0; dx < 2; dx += 1) {
@@ -232,7 +255,7 @@ active_set_emit_or_refine(ActiveSetCtx *ctx, ChunkCoord c) {
 }
 
 size_t
-chunk_active_set(
+chunk_active_set_hyst(
     float pov_x,
     float pov_z,
     uint32_t region_id,
@@ -240,7 +263,10 @@ chunk_active_set(
     uint32_t mesh_version,
     uint32_t material_version,
     ChunkGenKey *out_keys,
-    size_t out_capacity
+    size_t out_capacity,
+    const ChunkGenKey *prev_keys,
+    size_t prev_count,
+    float hysteresis
 ) {
     ActiveSetCtx ctx = {
         .pov_x = pov_x,
@@ -252,6 +278,9 @@ chunk_active_set(
         .out_keys = out_keys,
         .out_capacity = out_capacity,
         .count = 0u,
+        .prev = prev_keys,
+        .prev_count = prev_count,
+        .hysteresis = hysteresis,
     };
 
     const uint32_t coarse = CHUNK_LOD_COUNT - 1u;
@@ -267,6 +296,23 @@ chunk_active_set(
         }
     }
     return ctx.count;
+}
+
+size_t
+chunk_active_set(
+    float pov_x,
+    float pov_z,
+    uint32_t region_id,
+    uint32_t density_version,
+    uint32_t mesh_version,
+    uint32_t material_version,
+    ChunkGenKey *out_keys,
+    size_t out_capacity
+) {
+    return chunk_active_set_hyst(
+        pov_x, pov_z, region_id, density_version, mesh_version, material_version,
+        out_keys, out_capacity, NULL, 0u, 0.0f
+    );
 }
 
 size_t

@@ -318,6 +318,77 @@ test_seam_mask(void) {
     }
 }
 
+static bool
+key_sets_equal(const ChunkGenKey *a, size_t na, const ChunkGenKey *b, size_t nb) {
+    if (na != nb) {
+        return false;
+    }
+    for (size_t i = 0u; i < na; i += 1u) {
+        bool found = false;
+        for (size_t j = 0u; j < nb; j += 1u) {
+            if (a[i].cx == b[j].cx && a[i].cz == b[j].cz && a[i].lod == b[j].lod) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void
+test_active_set_hysteresis(void) {
+    const float c = chunk_region_extent() * 0.5f;
+
+    /* Fixed point: feeding a stationary frame's own output as prev changes
+     * nothing. */
+    ChunkGenKey s[4096];
+    const size_t ns = chunk_active_set(c, c, CHUNK_REGION_TEST, 1u, 1u, 1u, s, 4096u);
+    ChunkGenKey s2[4096];
+    const size_t ns2 = chunk_active_set_hyst(c, c, CHUNK_REGION_TEST, 1u, 1u, 1u, s2, 4096u, s, ns, 0.2f);
+    assert(key_sets_equal(s, ns, s2, ns2));
+
+    /* Jitter the POV back and forth across ~half a LOD1 chunk. Hysteresis must
+     * suppress the per-step LOD flip-flop that the stateless selection shows. */
+    const float jitter = chunk_world_size(1u) * 0.5f;
+    int nohyst_changes = 0;
+    int hyst_changes = 0;
+    ChunkGenKey prev_n[4096];
+    size_t prev_n_count = 0u;
+    ChunkGenKey prev_h[4096];
+    size_t prev_h_count = 0u;
+    ChunkGenKey cur[4096];
+
+    for (int step = 0; step < 40; step += 1) {
+        const float px = c + ((step % 2 == 0) ? 0.0f : jitter);
+
+        const size_t nn = chunk_active_set(px, c, CHUNK_REGION_TEST, 1u, 1u, 1u, cur, 4096u);
+        if (step > 0 && !key_sets_equal(cur, nn, prev_n, prev_n_count)) {
+            nohyst_changes += 1;
+        }
+        for (size_t i = 0u; i < nn; i += 1u) {
+            prev_n[i] = cur[i];
+        }
+        prev_n_count = nn;
+
+        const size_t nh = chunk_active_set_hyst(
+            px, c, CHUNK_REGION_TEST, 1u, 1u, 1u, cur, 4096u, prev_h, prev_h_count, 0.2f
+        );
+        if (step > 0 && !key_sets_equal(cur, nh, prev_h, prev_h_count)) {
+            hyst_changes += 1;
+        }
+        for (size_t i = 0u; i < nh; i += 1u) {
+            prev_h[i] = cur[i];
+        }
+        prev_h_count = nh;
+    }
+
+    assert(nohyst_changes > 0);          /* the jitter really does provoke flips */
+    assert(hyst_changes < nohyst_changes); /* hysteresis suppresses them */
+}
+
 static void
 test_active_set_multilod_in_region(void) {
     /* Even at a region corner, no active chunk falls outside the finite region. */
@@ -345,5 +416,6 @@ main(void) {
     test_active_set_core_is_finest_and_stable();
     test_active_set_multilod_in_region();
     test_seam_mask();
+    test_active_set_hysteresis();
     return 0;
 }
