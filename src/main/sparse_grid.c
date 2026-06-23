@@ -1,8 +1,74 @@
 #include "sparse_grid.h"
 
+#include <math.h>
 #include <stdlib.h>
 
 #include "chunk_coord.h"
+
+#define CHUNK_HEIGHT_SAMPLE_STEPS 4
+#define CHUNK_HEIGHT_MARGIN_CELLS 8.0f
+#define CHUNK_HEIGHT_MIN_MARGIN_WORLD 18.0f
+
+static bool
+packet_has_true_3d_features(const TerrainFieldPacket *packet) {
+    for (uint32_t i = 0u; i < packet->feature_count && i < TERRAIN_MAX_ACTIVE_FEATURES; i += 1u) {
+        switch (packet->features[i].type) {
+            case TERRAIN_FEATURE_CAVE_SUBTRACT:
+            case TERRAIN_FEATURE_CLIFF_CUT:
+            case TERRAIN_FEATURE_BOX_SOLID:
+            case TERRAIN_FEATURE_BOX_CUT:
+            case TERRAIN_FEATURE_CYLINDER_SOLID:
+                return true;
+            default:
+                break;
+        }
+    }
+    return false;
+}
+
+static TerrainHeightBounds
+chunk_local_height_bounds(const TerrainFieldPacket *packet, uint32_t lod, int32_t cx, int32_t cz) {
+    TerrainFieldPacket at_lod = *packet;
+    const float cell = chunk_cell_size(lod);
+    at_lod.base.grid_resolution = cell;
+
+    if (packet_has_true_3d_features(packet)) {
+        return terrain_field_packet_snap_height_bounds(&at_lod);
+    }
+
+    const ChunkCoord coord = {.cx = cx, .cz = cz, .lod = lod};
+    const ChunkAabb2 b = chunk_bounds(coord);
+    const float min_x = b.min_x - cell;
+    const float min_z = b.min_z - cell;
+    const float max_x = b.max_x + cell;
+    const float max_z = b.max_z + cell;
+
+    float min_h = INFINITY;
+    float max_h = -INFINITY;
+    for (uint32_t z = 0u; z <= CHUNK_HEIGHT_SAMPLE_STEPS; z += 1u) {
+        const float tz = (float)z / (float)CHUNK_HEIGHT_SAMPLE_STEPS;
+        const float wz = min_z + (max_z - min_z) * tz;
+        for (uint32_t x = 0u; x <= CHUNK_HEIGHT_SAMPLE_STEPS; x += 1u) {
+            const float tx = (float)x / (float)CHUNK_HEIGHT_SAMPLE_STEPS;
+            const float wx = min_x + (max_x - min_x) * tx;
+            const float h = terrain_field_surface_height_sample(packet, wx, wz);
+            if (!isfinite(h)) {
+                return terrain_field_packet_snap_height_bounds(&at_lod);
+            }
+            min_h = fminf(min_h, h);
+            max_h = fmaxf(max_h, h);
+        }
+    }
+
+    const float margin = fmaxf(CHUNK_HEIGHT_MIN_MARGIN_WORLD, cell * CHUNK_HEIGHT_MARGIN_CELLS) +
+        fmaxf(packet->base.warp_amount, 0.0f) * 0.5f;
+    const int32_t min_y = (int32_t)floorf((min_h - margin) / cell);
+    const int32_t max_y = (int32_t)ceilf((max_h + margin) / cell);
+    return (TerrainHeightBounds) {
+        .min_y = min_y,
+        .max_y = max_y < min_y + 1 ? min_y + 1 : max_y,
+    };
+}
 
 ChunkLayout
 sparse_grid_chunk_layout_packet(const TerrainFieldPacket *packet, uint32_t lod, int32_t cx, int32_t cz) {
@@ -10,9 +76,7 @@ sparse_grid_chunk_layout_packet(const TerrainFieldPacket *packet, uint32_t lod, 
 
     /* Height bounds are snapped at this LOD's cell size so coarser chunks hold
      * proportionally fewer Y cells while covering the same world height range. */
-    TerrainFieldPacket at_lod = *packet;
-    at_lod.base.grid_resolution = cell;
-    const TerrainHeightBounds hb = terrain_field_packet_snap_height_bounds(&at_lod);
+    const TerrainHeightBounds hb = chunk_local_height_bounds(packet, lod, cx, cz);
 
     const ChunkCoord coord = {.cx = cx, .cz = cz, .lod = lod};
     float origin_x = 0.0f;

@@ -73,6 +73,8 @@ typedef enum {
 #define CAM_FLIGHT_PITCH 1.4f    /* FLIGHT: up/down pitch rate */
 #define CAM_FLIGHT_ROLL 2.0f     /* FLIGHT: left/right bank rate */
 #define CAM_FLIGHT_ROLL_MAX 1.2f
+#define CAM_NEAR_Z 0.25f
+#define CAM_FAR_Z 4096.0f
 
 typedef struct AppState {
     SDL_Window *window;
@@ -276,7 +278,7 @@ make_camera_uniform(const AppState *state, uint32_t width, uint32_t height) {
     float view[16] = {0};
     CameraUniform camera = {0};
 
-    mat4_perspective(state->camera_fov_degrees * 3.1415926535f / 180.0f, aspect, 0.1f, 320.0f, projection);
+    mat4_perspective(state->camera_fov_degrees * 3.1415926535f / 180.0f, aspect, CAM_NEAR_Z, CAM_FAR_Z, projection);
     mat4_look_at(state->camera_position, center, up, view);
     mat4_mul(projection, view, camera.view_projection);
     return camera;
@@ -1650,10 +1652,12 @@ SDL_AppEvent(void *appstate, SDL_Event *event) {
     if (event->type == SDL_EVENT_MOUSE_MOTION) {
         /* MMB height nudge is a FREE-mode convenience only. */
         if (state->camera_mode == CAM_FREE && (event->motion.state & SDL_BUTTON_MMASK) != 0u) {
+            const float min_y = state->terrain_config.min_height - 256.0f;
+            const float max_y = state->terrain_config.max_height + 1024.0f;
             state->camera_position[1] = clampf(
                 state->camera_position[1] - event->motion.yrel * 0.18f,
-                -64.0f,
-                160.0f
+                min_y,
+                max_y
             );
             return SDL_APP_CONTINUE;
         }

@@ -773,11 +773,12 @@ terrain_region_apply_post_surface(const TerrainRegionNode *region, float mask, f
 }
 
 float
-terrain_field_density_sample(const TerrainFieldPacket *packet, float x, float y, float z) {
+terrain_field_surface_height_sample(const TerrainFieldPacket *packet, float x, float z) {
     TerrainEvalFields fields = {0};
     terrain_fields_init(&fields);
     float masks[TERRAIN_MAX_ACTIVE_REGIONS] = {0};
     float grade_y[TERRAIN_MAX_ACTIVE_REGIONS] = {0};
+    const float y = 0.0f;
     for (uint32_t i = 0u; i < packet->region_count && i < TERRAIN_MAX_ACTIVE_REGIONS; i += 1u) {
         const TerrainRegionNode *region = &packet->regions[i];
         if (!terrain_aabb_contains_xz(&region->effect_bbox, x, z)) {
@@ -802,6 +803,12 @@ terrain_field_density_sample(const TerrainFieldPacket *packet, float x, float y,
     for (uint32_t i = 0u; i < packet->feature_count && i < TERRAIN_MAX_ACTIVE_FEATURES; i += 1u) {
         surface += terrain_feature_height_delta(&packet->features[i], x, surface, z);
     }
+    return surface;
+}
+
+float
+terrain_field_density_sample(const TerrainFieldPacket *packet, float x, float y, float z) {
+    const float surface = terrain_field_surface_height_sample(packet, x, z);
 
     float sdf = y - surface;
     const float p[3] = {x, y, z};
