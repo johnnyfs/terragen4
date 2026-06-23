@@ -30,8 +30,8 @@ typedef struct ChunkRecord {
     float center_x;
     float center_z;
     int32_t slot;        /* index into the external resource pool */
-    uint32_t seam_want;  /* seam mask desired this frame (from neighbour LODs) */
-    uint32_t seam_built; /* seam mask the resident geometry was built with */
+    uint32_t seam_want;  /* seam mask observed this frame (from neighbour LODs) */
+    uint32_t seam_built; /* last observed seam mask; no longer triggers rebuild */
     uint64_t rendered_frame; /* last frame this record was drawn (render dedup) */
     bool occupied;       /* live entry */
     bool tombstone;      /* deleted marker for open-addressed probing */

@@ -107,7 +107,11 @@ typedef struct AppState {
     uint32_t dbg_misses;
     uint32_t dbg_evictions;
     uint32_t dbg_generated;
+    uint32_t dbg_fresh_generated;
     uint32_t dbg_failed;
+    uint32_t dbg_seam_only_changes;
+    uint32_t dbg_seam_refreshes_skipped;
+    uint32_t dbg_pipeline_recreates;
     uint32_t dbg_resident;
     uint32_t dbg_queue;
     uint32_t dbg_evictions_total;
@@ -665,6 +669,18 @@ build_and_upload_hud(AppState *state, SDL_GPUCommandBuffer *command_buffer) {
     SDL_snprintf(
         line,
         sizeof(line),
+        "FRESH%u SEAM%u SKIP%u PIPE%u",
+        state->dbg_fresh_generated,
+        state->dbg_seam_only_changes,
+        state->dbg_seam_refreshes_skipped,
+        state->dbg_pipeline_recreates
+    );
+    hud_emit_text(vertices, &count, x, y, scale, line);
+    y += line_step;
+
+    SDL_snprintf(
+        line,
+        sizeof(line),
         "J/K HEIGHT %.1f / %.1f",
         state->terrain_config.min_height,
         state->terrain_config.max_height
@@ -901,6 +917,7 @@ generate_chunk(AppState *state, SDL_GPUCommandBuffer *command_buffer, ChunkRecor
         /* The slot held a different-sized chunk (or none): rebuild its buffers.
          * Same-LOD reuse above keeps the common case allocation-free. */
         if (pipe->sample_pipeline != NULL) {
+            state->dbg_pipeline_recreates += 1u;
             terrain_gpu_destroy(state->device, pipe);
         }
         SparseGrid grid = {0};
@@ -914,8 +931,8 @@ generate_chunk(AppState *state, SDL_GPUCommandBuffer *command_buffer, ChunkRecor
         }
     }
 
-    /* Seam geometry depends on neighbour LODs (tracked per record, not in the
-     * key); set it after reuse/init (both of which leave it untouched/zeroed). */
+    /* Seam state is tracked for diagnostics only. Conservative all-border
+     * skirts are generated without refreshing chunks when neighbour LODs move. */
     pipe->seam_mask = rec->seam_want;
 
     rec->mem_estimate =
@@ -960,6 +977,11 @@ chunk_system_update(AppState *state) {
     state->dbg_misses = 0u;
     state->dbg_evictions = 0u;
     state->dbg_generated = 0u;
+    state->dbg_fresh_generated = 0u;
+    state->dbg_failed = 0u;
+    state->dbg_seam_only_changes = 0u;
+    state->dbg_seam_refreshes_skipped = 0u;
+    state->dbg_pipeline_recreates = 0u;
     for (uint32_t l = 0u; l < CHUNK_LOD_COUNT; l += 1u) {
         state->dbg_lod[l] = 0u;
     }
@@ -976,11 +998,10 @@ chunk_system_update(AppState *state) {
             rec->seam_want = desired_seam;
             if (rec->status == CHUNK_STATUS_READY) {
                 state->dbg_hits += 1u;
-                /* Neighbour LOD changed -> refresh skirts in place. The chunk
-                 * keeps rendering its current mesh until the refresh runs, so it
-                 * never blinks out (seams are not part of cache identity). */
                 if (rec->seam_built != desired_seam) {
-                    chunk_queue_push_if_absent(&state->chunk_cache, &key);
+                    state->dbg_seam_only_changes += 1u;
+                    state->dbg_seam_refreshes_skipped += 1u;
+                    rec->seam_built = desired_seam;
                 }
             }
             continue;
@@ -1023,23 +1044,20 @@ chunk_system_update(AppState *state) {
                 continue; /* evicted before generation ran */
             }
             const bool fresh = (rec->status == CHUNK_STATUS_QUEUED);
-            const bool refresh = (rec->status == CHUNK_STATUS_READY && rec->seam_built != rec->seam_want);
-            if (!fresh && !refresh) {
+            if (!fresh) {
                 continue; /* already up to date or mid-flight */
             }
-            if (fresh) {
-                rec->status = CHUNK_STATUS_GENERATING;
-            }
+            rec->status = CHUNK_STATUS_GENERATING;
             if (generate_chunk(state, command_buffer, rec)) {
                 rec->status = CHUNK_STATUS_READY;
                 rec->seam_built = rec->seam_want;
                 state->dbg_generated += 1u;
+                state->dbg_fresh_generated += 1u;
                 state->dbg_generated_total += 1u;
-            } else if (fresh) {
+            } else {
                 rec->status = CHUNK_STATUS_FAILED;
                 state->dbg_failed += 1u;
             }
-            /* A failed refresh keeps the chunk READY with its prior mesh. */
         }
         SDL_SubmitGPUCommandBuffer(command_buffer);
     }
@@ -1056,13 +1074,15 @@ chunk_system_update(AppState *state) {
     if ((state->frame_count % 120u) == 0u) {
         log_info(
             "chunks active=%u rendered=%u L0/L1/L2=%u/%u/%u resident=%u/%u queue=%u "
-            "hit=%u miss=%u evict=%u gen=%u fail=%u | totals gen=%u evict=%u",
+            "hit=%u miss=%u evict=%u gen=%u fresh=%u fail=%u seam=%u skip=%u pipe=%u | totals gen=%u evict=%u",
             state->dbg_active, state->dbg_rendered,
             state->dbg_lod[0], CHUNK_LOD_COUNT > 1u ? state->dbg_lod[1] : 0u,
             CHUNK_LOD_COUNT > 2u ? state->dbg_lod[2] : 0u,
             state->dbg_resident, (unsigned)state->pool_capacity, state->dbg_queue,
             state->dbg_hits, state->dbg_misses, state->dbg_evictions,
-            state->dbg_generated, state->dbg_failed,
+            state->dbg_generated, state->dbg_fresh_generated, state->dbg_failed,
+            state->dbg_seam_only_changes, state->dbg_seam_refreshes_skipped,
+            state->dbg_pipeline_recreates,
             state->dbg_generated_total, state->dbg_evictions_total
         );
     }

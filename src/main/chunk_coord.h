@@ -63,8 +63,9 @@ typedef struct ChunkAabb2 {
  *
  * Note: the seam mask is deliberately NOT part of identity. Neighbour LODs
  * change continuously as the POV moves; keying on them would make boundary
- * chunks miss the cache and blink out while regenerating. Instead the mask is
- * tracked per cache record and the chunk's skirts are refreshed in place.
+ * chunks miss the cache and blink out while regenerating. Instead seam state is
+ * tracked per cache record for diagnostics and skirts are generated
+ * conservatively.
  */
 typedef struct ChunkGenKey {
     uint32_t region_id;

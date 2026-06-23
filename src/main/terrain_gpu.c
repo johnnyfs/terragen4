@@ -6,6 +6,10 @@
 #include "gpu_shader.h"
 #include "log.h"
 
+#define CHUNK_SKIRTS_ENABLED 1
+#define CHUNK_SKIRT_POLICY_ALWAYS 1
+#define CHUNK_SKIRT_DEPTH_CELLS 2.0f
+
 typedef struct TerrainGpuParams {
     uint32_t counts[4];  /* cell_count, array_dim_x, array_dim_z, max_vertices */
     int32_t bounds[4];   /* local_min_y, array_dim_y, seed, octaves */
@@ -57,6 +61,11 @@ make_params(const TerrainGpuPipeline *pipeline) {
     const uint32_t feature_count = packet->feature_count < TERRAIN_MAX_ACTIVE_FEATURES
         ? packet->feature_count
         : TERRAIN_MAX_ACTIVE_FEATURES;
+#if CHUNK_SKIRTS_ENABLED && CHUNK_SKIRT_POLICY_ALWAYS
+    const float skirt_depth = layout->cell_size * CHUNK_SKIRT_DEPTH_CELLS;
+#else
+    const float skirt_depth = 0.0f;
+#endif
     TerrainGpuParams params = {
         .counts = {
             pipeline->cell_count,
@@ -86,10 +95,7 @@ make_params(const TerrainGpuPipeline *pipeline) {
             layout->origin_x,
             layout->origin_y,
             layout->origin_z,
-            /* Skirt depth only matters where a border is a transition; size it to
-             * the coarser neighbour's cells (2x this LOD) with headroom. Zero when
-             * this chunk has no transition borders. */
-            pipeline->seam_mask != 0u ? layout->cell_size * 8.0f : 0.0f,
+            skirt_depth,
         },
         .lmin = {layout->local_min_x, layout->local_min_z, (int32_t)packet->region_id, (int32_t)feature_count},
         .omin = {
