@@ -6,7 +6,14 @@ file(GLOB_RECURSE sources_test src/test/*.c)
 file(GLOB_RECURSE sources_shaders res/*.vert res/*.frag res/*.comp)
 file(GLOB_RECURSE shader_includes res/shaders/*.glsl)
 
-find_package(Vulkan REQUIRED COMPONENTS glslc)
+find_package(Vulkan QUIET COMPONENTS glslc)
+set(GLSLC_EXECUTABLE "${Vulkan_GLSLC_EXECUTABLE}")
+if(NOT GLSLC_EXECUTABLE)
+    find_program(GLSLC_EXECUTABLE NAMES glslc HINTS "$ENV{VULKAN_SDK}/bin")
+endif()
+if(NOT GLSLC_EXECUTABLE)
+    message(FATAL_ERROR "Could not find glslc. Install shaderc (for example: brew install shaderc).")
+endif()
 
 set(COMPILED_SHADERS)
 
@@ -21,7 +28,7 @@ foreach(SHADER IN LISTS sources_shaders)
     add_custom_command(
         OUTPUT "${SPV_FILE}"
         COMMAND "${CMAKE_COMMAND}" -E make_directory "${SPV_DIR}"
-        COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -I "${CMAKE_CURRENT_SOURCE_DIR}/res/shaders" "${SHADER}" -o "${SPV_FILE}"
+        COMMAND "${GLSLC_EXECUTABLE}" -I "${CMAKE_CURRENT_SOURCE_DIR}/res/shaders" "${SHADER}" -o "${SPV_FILE}"
         MAIN_DEPENDENCY "${SHADER}"
         DEPENDS ${shader_includes}
         COMMENT "Compiling ${SHADER_REL} to SPIR-V"
@@ -39,8 +46,36 @@ add_executable(terragen ${sources})
 add_dependencies(terragen CompileShaders)
 
 target_compile_options(terragen PUBLIC -std=c23 -Wall -Wfloat-conversion)
-target_include_directories(terragen PUBLIC src/main third_party ${SDL3_INCLUDE_DIRS})
-target_link_libraries(terragen ${SDL3_LIBRARIES} m)
+target_include_directories(terragen PUBLIC src/main third_party)
+if(TARGET SDL3::SDL3)
+    target_link_libraries(terragen SDL3::SDL3)
+else()
+    target_include_directories(terragen PUBLIC ${SDL3_INCLUDE_DIRS})
+    target_link_libraries(terragen ${SDL3_LIBRARIES})
+endif()
+target_link_libraries(terragen m)
+
+if(APPLE)
+    set(TERRAGEN_SHADERCROSS_ROOT "" CACHE PATH "SDL3_shadercross install prefix")
+    set(TERRAGEN_SHADERCROSS_PREFIXES)
+    if(TERRAGEN_SHADERCROSS_ROOT)
+        list(APPEND TERRAGEN_SHADERCROSS_PREFIXES "${TERRAGEN_SHADERCROSS_ROOT}")
+    endif()
+    list(APPEND TERRAGEN_SHADERCROSS_PREFIXES
+        "${CMAKE_CURRENT_SOURCE_DIR}/../SDL_shadercross-terragen/install"
+        "$ENV{HOME}/.local"
+    )
+
+    find_package(SDL3_shadercross CONFIG QUIET PATHS ${TERRAGEN_SHADERCROSS_PREFIXES})
+    if(NOT SDL3_shadercross_FOUND)
+        message(FATAL_ERROR "Could not find SDL3_shadercross. Build/install SDL_shadercross and add its prefix to CMAKE_PREFIX_PATH or TERRAGEN_SHADERCROSS_ROOT.")
+    endif()
+    if(NOT TARGET SDL3_shadercross::SDL3_shadercross)
+        message(FATAL_ERROR "SDL3_shadercross was found, but target SDL3_shadercross::SDL3_shadercross is missing.")
+    endif()
+    target_compile_definitions(terragen PRIVATE TERRAGEN_USE_SHADERCROSS=1)
+    target_link_libraries(terragen SDL3_shadercross::SDL3_shadercross)
+endif()
 
 add_custom_command(
     TARGET terragen POST_BUILD

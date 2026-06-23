@@ -3,6 +3,7 @@
 #include <stddef.h>
 
 #include "chunk_coord.h"
+#include "gpu_shader.h"
 #include "log.h"
 
 typedef struct TerrainGpuParams {
@@ -32,45 +33,6 @@ typedef struct HermiteCellGpu {
     float position[4];
     float normal_crossings[4];
 } HermiteCellGpu;
-
-static SDL_GPUComputePipeline *
-create_compute_pipeline(SDL_GPUDevice *device, const char *path, uint32_t readonly_buffers, uint32_t readwrite_buffers) {
-    size_t code_size = 0u;
-    void *code = SDL_LoadFile(path, &code_size);
-    if (code == NULL) {
-        const char *base_path = SDL_GetBasePath();
-        char *full_path = NULL;
-        if (base_path != NULL && SDL_asprintf(&full_path, "%s%s", base_path, path) >= 0) {
-            code = SDL_LoadFile(full_path, &code_size);
-            SDL_free(full_path);
-        }
-        if (code == NULL) {
-            log_error("Could not load compute shader %s: %s", path, SDL_GetError());
-            return NULL;
-        }
-    }
-
-    SDL_GPUComputePipelineCreateInfo info = {
-        .code_size = code_size,
-        .code = code,
-        .entrypoint = "main",
-        .format = SDL_GPU_SHADERFORMAT_SPIRV,
-        .num_readonly_storage_buffers = readonly_buffers,
-        .num_readwrite_storage_buffers = readwrite_buffers,
-        .num_uniform_buffers = 1,
-        .threadcount_x = 64u,
-        .threadcount_y = 1u,
-        .threadcount_z = 1u,
-    };
-
-    SDL_GPUComputePipeline *pipeline = SDL_CreateGPUComputePipeline(device, &info);
-    if (pipeline == NULL) {
-        log_error("Could not create compute pipeline from %s: %s", path, SDL_GetError());
-    }
-
-    SDL_free(code);
-    return pipeline;
-}
 
 static SDL_GPUBuffer *
 create_buffer(SDL_GPUDevice *device, SDL_GPUBufferUsageFlags usage, uint32_t size, const char *name) {
@@ -215,23 +177,35 @@ terrain_gpu_init(SDL_GPUDevice *device, const TerrainFieldPacket *packet, const 
     const uint32_t owned_area = (uint32_t)(layout->owned_dim_x * layout->owned_dim_z);
     pipeline->max_vertices = owned_area > 0u ? owned_area * 72u : 6u;
 
-    pipeline->sample_pipeline = create_compute_pipeline(
+    pipeline->sample_pipeline = gpu_shader_create_compute(
         device,
         "res/shaders/compiled/terrain_sample.comp.spv",
         1u,
-        1u
-    );
-    pipeline->hermite_pipeline = create_compute_pipeline(
-        device,
-        "res/shaders/compiled/terrain_hermite.comp.spv",
+        1u,
+        1u,
+        64u,
         1u,
         1u
     );
-    pipeline->mesh_pipeline = create_compute_pipeline(
+    pipeline->hermite_pipeline = gpu_shader_create_compute(
+        device,
+        "res/shaders/compiled/terrain_hermite.comp.spv",
+        1u,
+        1u,
+        1u,
+        64u,
+        1u,
+        1u
+    );
+    pipeline->mesh_pipeline = gpu_shader_create_compute(
         device,
         "res/shaders/compiled/terrain_mesh.comp.spv",
         2u,
-        2u
+        2u,
+        1u,
+        64u,
+        1u,
+        1u
     );
     if (pipeline->sample_pipeline == NULL || pipeline->hermite_pipeline == NULL || pipeline->mesh_pipeline == NULL) {
         return false;

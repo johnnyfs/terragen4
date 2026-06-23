@@ -7,6 +7,7 @@
 
 #include "chunk_cache.h"
 #include "chunk_coord.h"
+#include "gpu_shader.h"
 #include "gpu_texture.h"
 #include "materials.h"
 #include "sparse_grid.h"
@@ -73,6 +74,7 @@ typedef enum {
 typedef struct AppState {
     SDL_Window *window;
     SDL_GPUDevice *device;
+    bool shader_runtime_initialized;
     SDL_GPUGraphicsPipeline *graphics_pipeline;
     SDL_GPUGraphicsPipeline *hud_pipeline;
     SDL_GPUTexture *material_albedo;   /* 2D array, one layer per material */
@@ -131,41 +133,6 @@ typedef struct AppState {
 
     uint32_t palette_index;   /* active material "vibe"; cycled with P */
 } AppState;
-
-static SDL_GPUShader *
-compile_shader(const char *path, SDL_GPUShaderStage stage, SDL_GPUDevice *device, uint32_t uniform_buffers, uint32_t samplers) {
-    size_t code_size = 0u;
-    void *code = SDL_LoadFile(path, &code_size);
-    if (code == NULL) {
-        const char *base_path = SDL_GetBasePath();
-        char *full_path = NULL;
-        if (base_path != NULL && SDL_asprintf(&full_path, "%s%s", base_path, path) >= 0) {
-            code = SDL_LoadFile(full_path, &code_size);
-            SDL_free(full_path);
-        }
-        if (code == NULL) {
-            log_error("Could not load shader %s: %s", path, SDL_GetError());
-            return NULL;
-        }
-    }
-
-    SDL_GPUShaderCreateInfo info = {
-        .code = code,
-        .code_size = code_size,
-        .entrypoint = "main",
-        .format = SDL_GPU_SHADERFORMAT_SPIRV,
-        .stage = stage,
-        .num_uniform_buffers = uniform_buffers,
-        .num_samplers = samplers,
-    };
-
-    SDL_GPUShader *shader = SDL_CreateGPUShader(device, &info);
-    if (shader == NULL) {
-        log_error("Could not create shader from %s: %s", path, SDL_GetError());
-    }
-    SDL_free(code);
-    return shader;
-}
 
 static float
 vec3_dot(const float a[3], const float b[3]) {
@@ -343,17 +310,17 @@ create_material_textures(AppState *state) {
 
 static bool
 create_graphics_pipeline(AppState *state) {
-    SDL_GPUShader *vertex_shader = compile_shader(
+    SDL_GPUShader *vertex_shader = gpu_shader_create_graphics(
+        state->device,
         "res/shaders/compiled/vertex.vert.spv",
         SDL_GPU_SHADERSTAGE_VERTEX,
-        state->device,
         1u,
         0u
     );
-    SDL_GPUShader *fragment_shader = compile_shader(
+    SDL_GPUShader *fragment_shader = gpu_shader_create_graphics(
+        state->device,
         "res/shaders/compiled/fragment.frag.spv",
         SDL_GPU_SHADERSTAGE_FRAGMENT,
-        state->device,
         1u,
         2u
     );
@@ -436,17 +403,17 @@ create_graphics_pipeline(AppState *state) {
 
 static bool
 create_hud_pipeline(AppState *state) {
-    SDL_GPUShader *vertex_shader = compile_shader(
+    SDL_GPUShader *vertex_shader = gpu_shader_create_graphics(
+        state->device,
         "res/shaders/compiled/hud.vert.spv",
         SDL_GPU_SHADERSTAGE_VERTEX,
-        state->device,
         1u,
         0u
     );
-    SDL_GPUShader *fragment_shader = compile_shader(
+    SDL_GPUShader *fragment_shader = gpu_shader_create_graphics(
+        state->device,
         "res/shaders/compiled/hud.frag.spv",
         SDL_GPU_SHADERSTAGE_FRAGMENT,
-        state->device,
         0u,
         0u
     );
@@ -1413,7 +1380,16 @@ SDL_AppInit(void **appstate, int argc, char *argv[]) {
         SDL_RaiseWindow(state->window);
     }
 
-    state->device = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_SPIRV, true, NULL);
+    if (!gpu_shader_runtime_init()) {
+        return SDL_APP_FAILURE;
+    }
+    state->shader_runtime_initialized = true;
+
+    state->device = SDL_CreateGPUDevice(
+        gpu_shader_supported_formats(),
+        true,
+        gpu_shader_preferred_driver()
+    );
     if (state->device == NULL) {
         log_error("Could not get GPU device: %s", SDL_GetError());
         return SDL_APP_FAILURE;
@@ -1697,6 +1673,9 @@ SDL_AppQuit(void *appstate, SDL_AppResult result) {
             SDL_ReleaseGPUGraphicsPipeline(state->device, state->graphics_pipeline);
         }
         SDL_DestroyGPUDevice(state->device);
+    }
+    if (state->shader_runtime_initialized) {
+        gpu_shader_runtime_quit();
     }
     chunk_cache_destroy(&state->chunk_cache);
     free(state->chunk_pool);
