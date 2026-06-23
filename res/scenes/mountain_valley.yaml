@@ -1,0 +1,191 @@
+version: 1
+
+scene:
+  id: test_mountain_valley
+  name: "Mountain Valley Test"
+
+  world:
+    region_size_chunks: 24
+    base_cell_size: 1.0
+    chunk_cells: 24
+    lod_count: 3
+
+  height:
+    min: -32
+    max: 280
+    base: 24
+
+  noise:
+    seed: 12345
+    octaves:
+      - name: macro
+        kind: fbm
+        frequency: 0.015
+        amplitude: 48.0
+      - name: forms
+        kind: fbm
+        frequency: 0.055
+        amplitude: 20.0
+      - name: detail
+        kind: fbm
+        frequency: 0.14
+        amplitude: 7.0
+      - name: ridges
+        kind: ridged
+        frequency: 0.075
+        amplitude: 16.0
+        sharpness: 1.15
+    lacunarity: 2.05
+    gain: 0.48
+
+  warp:
+    frequency: 0.035
+    amplitude: 8.0
+
+  material:
+    default_vibe: Meadow
+    default_flat_material: grass
+    default_slope_material: stone
+
+regions:
+  - id: mountain_area
+    kind: mountain
+    geometry:
+      type: box
+      center: [288, 100, 288]
+      size: [760, 520, 760]
+      edge_noise: 0.0
+    transition:
+      type: smoothstep
+      falloff: 120
+      cutoff_epsilon: 0.01
+    priority: 10
+    influences:
+      - field: height
+        mode: add
+        value: 110
+      - field: octave_amplitude
+        octave: ridges
+        mode: multiply
+        value: 1.45
+      - field: octave_amplitude
+        octave: detail
+        mode: multiply
+        value: 1.20
+
+  - id: valley_floor
+    parent: mountain_area
+    kind: valley
+    geometry:
+      type: capsule_path
+      points:
+        - [68, 42, 408]
+        - [188, 36, 326]
+        - [328, 32, 264]
+        - [508, 28, 148]
+      radius: 140
+      mask_warp: 0.0
+    transition:
+      type: smoothstep
+      falloff: 90
+      cutoff_epsilon: 0.01
+    priority: 40
+    influences:
+      - field: height
+        mode: pull_to_target
+        target: 34
+        strength: 0.86
+      - field: octave_amplitude
+        octave: ridges
+        mode: multiply
+        value: 0.22
+      - field: octave_amplitude
+        octave: detail
+        mode: multiply
+        value: 0.35
+
+  - id: plateau_lookout
+    parent: valley_floor
+    kind: plateau
+    allow_outside_parent: true
+    geometry:
+      type: oriented_box
+      center: [356, 88, 252]
+      size: [170, 86, 132]
+      rotation_y: -14
+    transition:
+      type: smoothstep
+      falloff: 45
+      cutoff_epsilon: 0.01
+    priority: 60
+    influences:
+      - field: height
+        mode: pull_to_target
+        target: 96
+        strength: 0.94
+      - field: octave_amplitude
+        octave: detail
+        mode: multiply
+        value: 0.12
+      - field: octave_amplitude
+        octave: ridges
+        mode: multiply
+        value: 0.18
+
+  - id: path_plateau_to_valley
+    parent: valley_floor
+    kind: path
+    allow_outside_parent: true
+    geometry:
+      type: capsule_path
+      points:
+        - [356, 96, 252]
+        - [320, 76, 288]
+        - [266, 54, 320]
+        - [202, 38, 338]
+      radius: 20
+      mask_warp: 0.0
+    transition:
+      type: smoothstep
+      falloff: 32
+      cutoff_epsilon: 0.01
+    priority: 80
+    influences:
+      - field: height
+        mode: pull_to_path_grade
+        strength: 0.90
+      - field: octave_amplitude
+        octave: detail
+        mode: multiply
+        value: 0.08
+      - field: octave_amplitude
+        octave: ridges
+        mode: multiply
+        value: 0.06
+
+  - id: dry_riverbed
+    parent: valley_floor
+    kind: riverbed
+    allow_outside_parent: true
+    geometry:
+      type: capsule_path
+      points:
+        - [116, 46, 392]
+        - [218, 36, 310]
+        - [338, 30, 238]
+        - [476, 24, 132]
+      radius: 28
+      mask_warp: 0.0
+    transition:
+      type: smoothstep
+      falloff: 38
+      cutoff_epsilon: 0.01
+    priority: 90
+    influences:
+      - field: height
+        mode: add
+        value: -18
+      - field: octave_amplitude
+        octave: detail
+        mode: multiply
+        value: 0.18

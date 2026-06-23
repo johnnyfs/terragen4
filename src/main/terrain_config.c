@@ -2,6 +2,7 @@
 
 #include <math.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 TerrainRegionConfig
@@ -21,6 +22,13 @@ terrain_default_region_config(void) {
         .noise_lacunarity = 2.05f,
         .noise_gain = 0.48f,
         .noise_octaves = 4u,
+        .basis_count = 0u,
+        .basis = {
+            {.name = "macro", .kind = TERRAIN_NOISE_FBM, .frequency = 0.015f, .amplitude = 80.0f, .sharpness = 1.0f},
+            {.name = "forms", .kind = TERRAIN_NOISE_FBM, .frequency = 0.055f, .amplitude = 24.0f, .sharpness = 1.0f},
+            {.name = "detail", .kind = TERRAIN_NOISE_FBM, .frequency = 0.140f, .amplitude = 7.0f, .sharpness = 1.0f},
+            {.name = "ridges", .kind = TERRAIN_NOISE_RIDGED, .frequency = 0.075f, .amplitude = 14.0f, .sharpness = 1.0f},
+        },
         .peak_count = 0u,
     };
     terrain_region_apply_height_range(&config);
@@ -104,6 +112,46 @@ terrain_feature_vertical_headroom(const TerrainFeature *feature) {
 }
 
 static float
+terrain_region_vertical_headroom(const TerrainRegionNode *region) {
+    float headroom = 0.0f;
+    for (uint32_t i = 0u; i < region->influence_count && i < TERRAIN_MAX_REGION_INFLUENCES; i += 1u) {
+        const TerrainRegionInfluence *influence = &region->influences[i];
+        if (influence->field != TERRAIN_REGION_FIELD_HEIGHT) {
+            continue;
+        }
+        if (influence->mode == TERRAIN_REGION_BLEND_ADD && influence->value > 0.0f) {
+            headroom += influence->value;
+        } else if (influence->mode == TERRAIN_REGION_BLEND_PULL_TO_TARGET ||
+                   influence->mode == TERRAIN_REGION_BLEND_PULL_TO_PATH_GRADE ||
+                   influence->mode == TERRAIN_REGION_BLEND_OVERRIDE) {
+            headroom = fmaxf(headroom, influence->target - region->authored_bbox.max[1]);
+        }
+    }
+    return fmaxf(headroom, 0.0f);
+}
+
+static float
+terrain_region_vertical_footroom(const TerrainRegionNode *region) {
+    float footroom = 0.0f;
+    for (uint32_t i = 0u; i < region->influence_count && i < TERRAIN_MAX_REGION_INFLUENCES; i += 1u) {
+        const TerrainRegionInfluence *influence = &region->influences[i];
+        if (influence->field != TERRAIN_REGION_FIELD_HEIGHT &&
+            influence->field != TERRAIN_REGION_FIELD_CARVE_AMOUNT) {
+            continue;
+        }
+        if (influence->mode == TERRAIN_REGION_BLEND_ADD && influence->value < 0.0f) {
+            footroom += -influence->value;
+        } else if (influence->mode == TERRAIN_REGION_BLEND_SUBTRACT) {
+            footroom += fabsf(influence->value);
+        } else if (influence->mode == TERRAIN_REGION_BLEND_PULL_TO_TARGET ||
+                   influence->mode == TERRAIN_REGION_BLEND_OVERRIDE) {
+            footroom = fmaxf(footroom, region->authored_bbox.min[1] - influence->target);
+        }
+    }
+    return fmaxf(footroom, 0.0f);
+}
+
+static float
 terrain_feature_vertical_footroom(const TerrainFeature *feature) {
     switch (feature->type) {
         case TERRAIN_FEATURE_RIVERBED_TROUGH:
@@ -130,6 +178,10 @@ terrain_field_packet_snap_height_bounds(const TerrainFieldPacket *packet) {
     for (uint32_t i = 0u; i < packet->feature_count && i < TERRAIN_MAX_ACTIVE_FEATURES; i += 1u) {
         min_height -= terrain_feature_vertical_footroom(&packet->features[i]);
         max_height += terrain_feature_vertical_headroom(&packet->features[i]);
+    }
+    for (uint32_t i = 0u; i < packet->region_count && i < TERRAIN_MAX_ACTIVE_REGIONS; i += 1u) {
+        min_height -= terrain_region_vertical_footroom(&packet->regions[i]);
+        max_height += terrain_region_vertical_headroom(&packet->regions[i]);
     }
     const int32_t min_y = (int32_t)floorf(min_height / resolution);
     const int32_t max_y = (int32_t)ceilf(max_height / resolution);
@@ -167,6 +219,18 @@ terrain_density_hash(const TerrainRegionConfig *config) {
     h = terrain_hash_f32(h, config->noise_lacunarity);
     h = terrain_hash_f32(h, config->noise_gain);
     h ^= terrain_hash_u32(config->noise_octaves + 0x0000abcdu);
+    h ^= terrain_hash_u32(config->basis_count + 0x0b4515u);
+    for (uint32_t i = 0u; i < config->basis_count && i < TERRAIN_MAX_NOISE_OCTAVES; i += 1u) {
+        const TerrainNoiseOctave *octave = &config->basis[i];
+        h ^= terrain_hash_u32((uint32_t)octave->kind + 0x501d5u);
+        for (const char *p = octave->name; *p != '\0'; p += 1) {
+            h ^= terrain_hash_u32((uint32_t)(unsigned char)*p + 0xabcdu);
+            h = terrain_hash_u32(h);
+        }
+        h = terrain_hash_f32(h, octave->frequency);
+        h = terrain_hash_f32(h, octave->amplitude);
+        h = terrain_hash_f32(h, octave->sharpness);
+    }
 
     /* Fold in every peak field so edits invalidate cached chunks and reverts
      * reuse them exactly. */
@@ -200,6 +264,46 @@ terrain_feature_hash(uint32_t h, const TerrainFeature *feature) {
     return terrain_hash_u32(h);
 }
 
+static uint32_t
+terrain_region_hash(uint32_t h, const TerrainRegionNode *region) {
+    for (const char *p = region->id; *p != '\0'; p += 1) {
+        h ^= terrain_hash_u32((uint32_t)(unsigned char)*p + 0x2c9fu);
+        h = terrain_hash_u32(h);
+    }
+    h ^= terrain_hash_u32(region->priority + 0x93a5u);
+    h ^= terrain_hash_u32((uint32_t)region->geometry.type + 0x1f123u);
+    for (uint32_t i = 0u; i < 3u; i += 1u) {
+        h = terrain_hash_f32(h, region->geometry.center[i]);
+        h = terrain_hash_f32(h, region->geometry.size[i]);
+        h = terrain_hash_f32(h, region->authored_bbox.min[i]);
+        h = terrain_hash_f32(h, region->authored_bbox.max[i]);
+        h = terrain_hash_f32(h, region->effect_bbox.min[i]);
+        h = terrain_hash_f32(h, region->effect_bbox.max[i]);
+    }
+    h = terrain_hash_f32(h, region->geometry.rotation_y_degrees);
+    h = terrain_hash_f32(h, region->geometry.radius);
+    h = terrain_hash_f32(h, region->geometry.mask_warp);
+    h = terrain_hash_f32(h, region->transition_falloff);
+    h = terrain_hash_f32(h, region->cutoff_epsilon);
+    h ^= terrain_hash_u32(region->geometry.point_count + 0x8811u);
+    for (uint32_t i = 0u; i < region->geometry.point_count && i < TERRAIN_MAX_REGION_POINTS; i += 1u) {
+        h = terrain_hash_f32(h, region->geometry.points[i][0]);
+        h = terrain_hash_f32(h, region->geometry.points[i][1]);
+        h = terrain_hash_f32(h, region->geometry.points[i][2]);
+    }
+    h ^= terrain_hash_u32(region->influence_count + 0x7e57u);
+    for (uint32_t i = 0u; i < region->influence_count && i < TERRAIN_MAX_REGION_INFLUENCES; i += 1u) {
+        const TerrainRegionInfluence *influence = &region->influences[i];
+        h ^= terrain_hash_u32((uint32_t)influence->field + 0x5511u);
+        h ^= terrain_hash_u32((uint32_t)influence->mode + 0x5512u);
+        h ^= terrain_hash_u32((uint32_t)influence->octave_index + 0x5513u);
+        h = terrain_hash_f32(h, influence->value);
+        h = terrain_hash_f32(h, influence->target);
+        h = terrain_hash_f32(h, influence->strength);
+    }
+    return terrain_hash_u32(h);
+}
+
 uint32_t
 terrain_field_packet_hash(const TerrainFieldPacket *packet) {
     uint32_t h = terrain_density_hash(&packet->base);
@@ -207,6 +311,10 @@ terrain_field_packet_hash(const TerrainFieldPacket *packet) {
     h ^= terrain_hash_u32(packet->feature_count + 0x51f15eedu);
     for (uint32_t i = 0u; i < packet->feature_count && i < TERRAIN_MAX_ACTIVE_FEATURES; i += 1u) {
         h = terrain_feature_hash(h, &packet->features[i]);
+    }
+    h ^= terrain_hash_u32(packet->region_count + 0x6633u);
+    for (uint32_t i = 0u; i < packet->region_count && i < TERRAIN_MAX_ACTIVE_REGIONS; i += 1u) {
+        h = terrain_region_hash(h, &packet->regions[i]);
     }
     return terrain_hash_u32(h);
 }
@@ -219,6 +327,8 @@ terrain_field_packet_from_config(const TerrainRegionConfig *config) {
         .feature_count = 0u,
         .overflow_count = 0u,
         .min_lod = UINT32_MAX,
+        .region_count = 0u,
+        .region_overflow_count = 0u,
     };
     for (uint32_t i = 0u; i < config->peak_count && i < TERRAIN_MAX_PEAKS; i += 1u) {
         if (packet.feature_count >= TERRAIN_MAX_ACTIVE_FEATURES) {
@@ -340,13 +450,55 @@ terrain_fbm3(const TerrainRegionConfig *config, float x, float y, float z) {
 }
 
 static float
-terrain_base_displacement(const TerrainRegionConfig *config, float x, float y, float z) {
+terrain_fbm3_custom(const TerrainRegionConfig *config, float x, float y, float z, float frequency, uint32_t seed_base) {
+    float sum = 0.0f;
+    float amplitude = 1.0f;
+    float normalizer = 0.0f;
+    const uint32_t octaves = config->noise_octaves < 1u ? 1u : config->noise_octaves;
+
+    for (uint32_t i = 0u; i < octaves; i += 1u) {
+        sum += terrain_noise3(config, seed_base + i * 101u, x * frequency, y * frequency, z * frequency) * amplitude;
+        normalizer += amplitude;
+        frequency *= config->noise_lacunarity;
+        amplitude *= config->noise_gain;
+    }
+
+    return normalizer > 0.0f ? sum / normalizer : 0.0f;
+}
+
+static float
+terrain_base_displacement_scaled(
+    const TerrainRegionConfig *config,
+    float x,
+    float y,
+    float z,
+    const float *octave_scales,
+    float warp_scale
+) {
+    const float warp_amount = config->warp_amount * warp_scale;
     const float warp_x = terrain_noise3(config, 311u, x * config->warp_frequency, y * config->warp_frequency, z * config->warp_frequency);
     const float warp_y = terrain_noise3(config, 719u, x * config->warp_frequency, y * config->warp_frequency, z * config->warp_frequency);
     const float warp_z = terrain_noise3(config, 1201u, x * config->warp_frequency, y * config->warp_frequency, z * config->warp_frequency);
-    const float wx = x + warp_x * config->warp_amount;
-    const float wy = y + warp_y * config->warp_amount;
-    const float wz = z + warp_z * config->warp_amount;
+    const float wx = x + warp_x * warp_amount;
+    const float wy = y + warp_y * warp_amount;
+    const float wz = z + warp_z * warp_amount;
+
+    if (config->basis_count > 0u) {
+        float sum = 0.0f;
+        for (uint32_t i = 0u; i < config->basis_count && i < TERRAIN_MAX_NOISE_OCTAVES; i += 1u) {
+            const TerrainNoiseOctave *octave = &config->basis[i];
+            const float scale = octave_scales != NULL ? octave_scales[i] : 1.0f;
+            if (octave->kind == TERRAIN_NOISE_RIDGED) {
+                const float n = terrain_fbm3_custom(config, wx + 53.0f, wy * 0.7f, wz - 29.0f, octave->frequency, 900u + i * 131u);
+                const float sharpness = fmaxf(octave->sharpness, 0.001f);
+                sum += (powf(1.0f - fabsf(n), sharpness) * 2.0f - 1.0f) * octave->amplitude * scale;
+            } else {
+                sum += terrain_fbm3_custom(config, wx, wy, wz, octave->frequency, i * 131u) * octave->amplitude * scale;
+            }
+        }
+        return sum;
+    }
+
     const float broad = terrain_noise3(config, 0u, wx * config->noise_frequency * 0.38f, 0.0f, wz * config->noise_frequency * 0.38f);
     const float detail = terrain_fbm3(config, wx, wy, wz);
     const float ridge = (1.0f - fabsf(terrain_fbm3(config, wx + 53.0f, wy * 0.7f, wz - 29.0f))) * 2.0f - 1.0f;
@@ -437,9 +589,216 @@ terrain_feature_height_delta(const TerrainFeature *feature, float x, float curre
     }
 }
 
+static bool
+terrain_aabb_contains_point(const TerrainAabb3 *b, float x, float y, float z) {
+    return x >= b->min[0] && x <= b->max[0] &&
+           y >= b->min[1] && y <= b->max[1] &&
+           z >= b->min[2] && z <= b->max[2];
+}
+
+static bool
+terrain_aabb_contains_xz(const TerrainAabb3 *b, float x, float z) {
+    return x >= b->min[0] && x <= b->max[0] &&
+           z >= b->min[2] && z <= b->max[2];
+}
+
+static float
+terrain_region_edge_mask(float signed_distance, float falloff) {
+    if (signed_distance <= 0.0f) {
+        return 1.0f;
+    }
+    const float edge = fmaxf(falloff, 1e-3f);
+    return 1.0f - terrain_smoothstep(terrain_saturate(signed_distance / edge));
+}
+
+static float
+terrain_region_path_distance_xz(const TerrainRegionGeometry *geometry, float x, float z, float *out_grade_y) {
+    if (geometry->point_count == 0u) {
+        if (out_grade_y != NULL) {
+            *out_grade_y = geometry->center[1];
+        }
+        return hypotf(x - geometry->center[0], z - geometry->center[2]);
+    }
+    if (geometry->point_count == 1u) {
+        if (out_grade_y != NULL) {
+            *out_grade_y = geometry->points[0][1];
+        }
+        return hypotf(x - geometry->points[0][0], z - geometry->points[0][2]);
+    }
+
+    float best_dist2 = INFINITY;
+    float best_y = geometry->points[0][1];
+    for (uint32_t i = 0u; i + 1u < geometry->point_count && i + 1u < TERRAIN_MAX_REGION_POINTS; i += 1u) {
+        const float ax = geometry->points[i][0];
+        const float ay = geometry->points[i][1];
+        const float az = geometry->points[i][2];
+        const float bx = geometry->points[i + 1u][0];
+        const float by = geometry->points[i + 1u][1];
+        const float bz = geometry->points[i + 1u][2];
+        const float vx = bx - ax;
+        const float vz = bz - az;
+        const float len2 = vx * vx + vz * vz;
+        float t = len2 > 1e-6f ? ((x - ax) * vx + (z - az) * vz) / len2 : 0.0f;
+        t = terrain_saturate(t);
+        const float px = ax + vx * t;
+        const float pz = az + vz * t;
+        const float dx = x - px;
+        const float dz = z - pz;
+        const float d2 = dx * dx + dz * dz;
+        if (d2 < best_dist2) {
+            best_dist2 = d2;
+            best_y = ay + (by - ay) * t;
+        }
+    }
+    if (out_grade_y != NULL) {
+        *out_grade_y = best_y;
+    }
+    return sqrtf(best_dist2);
+}
+
+static float
+terrain_region_mask(const TerrainRegionNode *region, float x, float y, float z, float *out_grade_y) {
+    (void)y;
+    const TerrainRegionGeometry *geometry = &region->geometry;
+    const float falloff = region->transition_falloff;
+    switch (geometry->type) {
+        case TERRAIN_REGION_GEOM_BOX:
+        case TERRAIN_REGION_GEOM_ORIENTED_BOX: {
+            float px = x - geometry->center[0];
+            float pz = z - geometry->center[2];
+            if (geometry->type == TERRAIN_REGION_GEOM_ORIENTED_BOX) {
+                const float r = -geometry->rotation_y_degrees * 3.1415926535f / 180.0f;
+                const float cr = cosf(r);
+                const float sr = sinf(r);
+                const float rx = px * cr - pz * sr;
+                const float rz = px * sr + pz * cr;
+                px = rx;
+                pz = rz;
+            }
+            const float hx = fmaxf(geometry->size[0] * 0.5f, 1e-3f);
+            const float hz = fmaxf(geometry->size[2] * 0.5f, 1e-3f);
+            const float qx = fabsf(px) - hx;
+            const float qz = fabsf(pz) - hz;
+            const float ox = fmaxf(qx, 0.0f);
+            const float oz = fmaxf(qz, 0.0f);
+            const float outside = hypotf(ox, oz);
+            const float inside = fminf(fmaxf(qx, qz), 0.0f);
+            return terrain_region_edge_mask(outside + inside, falloff);
+        }
+        case TERRAIN_REGION_GEOM_SPHERE:
+        case TERRAIN_REGION_GEOM_ELLIPSOID: {
+            const float ex = fmaxf((geometry->type == TERRAIN_REGION_GEOM_SPHERE ? geometry->radius : geometry->size[0] * 0.5f), 1e-3f);
+            const float ez = fmaxf((geometry->type == TERRAIN_REGION_GEOM_SPHERE ? geometry->radius : geometry->size[2] * 0.5f), 1e-3f);
+            const float dx = (x - geometry->center[0]) / ex;
+            const float dz = (z - geometry->center[2]) / ez;
+            const float dist = (sqrtf(dx * dx + dz * dz) - 1.0f) * fminf(ex, ez);
+            return terrain_region_edge_mask(dist, falloff);
+        }
+        case TERRAIN_REGION_GEOM_CAPSULE_PATH: {
+            float grade_y = geometry->center[1];
+            const float dist = terrain_region_path_distance_xz(geometry, x, z, &grade_y) - fmaxf(geometry->radius, 0.0f);
+            if (out_grade_y != NULL) {
+                *out_grade_y = grade_y;
+            }
+            return terrain_region_edge_mask(dist, falloff);
+        }
+        case TERRAIN_REGION_GEOM_PLANE_RAMP:
+        default:
+            return terrain_aabb_contains_point(&region->effect_bbox, x, y, z) ? 1.0f : 0.0f;
+    }
+}
+
+typedef struct TerrainEvalFields {
+    float height_offset;
+    float octave_scale[TERRAIN_MAX_NOISE_OCTAVES];
+    float warp_scale;
+} TerrainEvalFields;
+
+static void
+terrain_fields_init(TerrainEvalFields *fields) {
+    fields->height_offset = 0.0f;
+    fields->warp_scale = 1.0f;
+    for (uint32_t i = 0u; i < TERRAIN_MAX_NOISE_OCTAVES; i += 1u) {
+        fields->octave_scale[i] = 1.0f;
+    }
+}
+
+static void
+terrain_region_apply_pre_surface(TerrainEvalFields *fields, const TerrainRegionNode *region, float mask) {
+    for (uint32_t i = 0u; i < region->influence_count && i < TERRAIN_MAX_REGION_INFLUENCES; i += 1u) {
+        const TerrainRegionInfluence *influence = &region->influences[i];
+        if (influence->field == TERRAIN_REGION_FIELD_HEIGHT) {
+            if (influence->mode == TERRAIN_REGION_BLEND_ADD) {
+                fields->height_offset += influence->value * mask;
+            } else if (influence->mode == TERRAIN_REGION_BLEND_SUBTRACT) {
+                fields->height_offset -= fabsf(influence->value) * mask;
+            }
+        } else if (influence->field == TERRAIN_REGION_FIELD_OCTAVE_AMPLITUDE &&
+                   influence->octave_index >= 0 &&
+                   influence->octave_index < (int32_t)TERRAIN_MAX_NOISE_OCTAVES) {
+            const uint32_t oi = (uint32_t)influence->octave_index;
+            if (influence->mode == TERRAIN_REGION_BLEND_MULTIPLY) {
+                fields->octave_scale[oi] *= 1.0f + (influence->value - 1.0f) * mask;
+            } else if (influence->mode == TERRAIN_REGION_BLEND_OVERRIDE) {
+                fields->octave_scale[oi] = terrain_lerp(fields->octave_scale[oi], influence->value, mask);
+            } else if (influence->mode == TERRAIN_REGION_BLEND_ADD) {
+                fields->octave_scale[oi] += influence->value * mask;
+            }
+        } else if (influence->field == TERRAIN_REGION_FIELD_WARP_AMOUNT_SCALE) {
+            if (influence->mode == TERRAIN_REGION_BLEND_MULTIPLY) {
+                fields->warp_scale *= 1.0f + (influence->value - 1.0f) * mask;
+            } else if (influence->mode == TERRAIN_REGION_BLEND_OVERRIDE) {
+                fields->warp_scale = terrain_lerp(fields->warp_scale, influence->value, mask);
+            }
+        }
+    }
+}
+
+static float
+terrain_region_apply_post_surface(const TerrainRegionNode *region, float mask, float grade_y, float surface) {
+    for (uint32_t i = 0u; i < region->influence_count && i < TERRAIN_MAX_REGION_INFLUENCES; i += 1u) {
+        const TerrainRegionInfluence *influence = &region->influences[i];
+        if (influence->field != TERRAIN_REGION_FIELD_HEIGHT) {
+            continue;
+        }
+        if (influence->mode == TERRAIN_REGION_BLEND_PULL_TO_TARGET ||
+            influence->mode == TERRAIN_REGION_BLEND_OVERRIDE) {
+            const float strength = influence->mode == TERRAIN_REGION_BLEND_OVERRIDE ? 1.0f : terrain_saturate(influence->strength);
+            surface += (influence->target - surface) * strength * mask;
+        } else if (influence->mode == TERRAIN_REGION_BLEND_PULL_TO_PATH_GRADE) {
+            surface += (grade_y - surface) * terrain_saturate(influence->strength) * mask;
+        }
+    }
+    return surface;
+}
+
 float
 terrain_field_density_sample(const TerrainFieldPacket *packet, float x, float y, float z) {
-    float surface = packet->base.base_height + terrain_base_displacement(&packet->base, x, y, z);
+    TerrainEvalFields fields = {0};
+    terrain_fields_init(&fields);
+    float masks[TERRAIN_MAX_ACTIVE_REGIONS] = {0};
+    float grade_y[TERRAIN_MAX_ACTIVE_REGIONS] = {0};
+    for (uint32_t i = 0u; i < packet->region_count && i < TERRAIN_MAX_ACTIVE_REGIONS; i += 1u) {
+        const TerrainRegionNode *region = &packet->regions[i];
+        if (!terrain_aabb_contains_xz(&region->effect_bbox, x, z)) {
+            continue;
+        }
+        masks[i] = terrain_region_mask(region, x, y, z, &grade_y[i]);
+        if (masks[i] <= region->cutoff_epsilon) {
+            masks[i] = 0.0f;
+            continue;
+        }
+        terrain_region_apply_pre_surface(&fields, region, masks[i]);
+    }
+
+    float surface = packet->base.base_height +
+        terrain_base_displacement_scaled(&packet->base, x, y, z, fields.octave_scale, fields.warp_scale) +
+        fields.height_offset;
+    for (uint32_t i = 0u; i < packet->region_count && i < TERRAIN_MAX_ACTIVE_REGIONS; i += 1u) {
+        if (masks[i] > 0.0f) {
+            surface = terrain_region_apply_post_surface(&packet->regions[i], masks[i], grade_y[i], surface);
+        }
+    }
     for (uint32_t i = 0u; i < packet->feature_count && i < TERRAIN_MAX_ACTIVE_FEATURES; i += 1u) {
         surface += terrain_feature_height_delta(&packet->features[i], x, surface, z);
     }
@@ -506,6 +865,21 @@ terrain_world_add_feature(TerrainWorld *world, TerrainFeature feature) {
     return true;
 }
 
+bool
+terrain_world_add_region(TerrainWorld *world, TerrainRegionNode region) {
+    if (world->region_count >= TERRAIN_MAX_WORLD_REGIONS) {
+        return false;
+    }
+    if (region.cutoff_epsilon <= 0.0f) {
+        region.cutoff_epsilon = 0.01f;
+    }
+    if (region.transition_falloff < 0.0f) {
+        region.transition_falloff = 0.0f;
+    }
+    world->regions[world->region_count++] = region;
+    return true;
+}
+
 void
 terrain_world_add_demo_features(TerrainWorld *world, float center_x, float center_z) {
     (void)terrain_world_add_feature(world, (TerrainFeature) {
@@ -549,6 +923,25 @@ terrain_feature_overlaps_xz(const TerrainFeature *feature, float min_x, float mi
     return dx * dx + dz * dz <= radius * radius;
 }
 
+static bool
+terrain_aabb_overlaps_xz(const TerrainAabb3 *b, float min_x, float min_z, float max_x, float max_z) {
+    return b->max[0] >= min_x && b->min[0] <= max_x &&
+           b->max[2] >= min_z && b->min[2] <= max_z;
+}
+
+static void
+terrain_packet_sort_regions(TerrainFieldPacket *packet) {
+    for (uint32_t i = 1u; i < packet->region_count; i += 1u) {
+        TerrainRegionNode key = packet->regions[i];
+        uint32_t j = i;
+        while (j > 0u && packet->regions[j - 1u].priority > key.priority) {
+            packet->regions[j] = packet->regions[j - 1u];
+            j -= 1u;
+        }
+        packet->regions[j] = key;
+    }
+}
+
 bool
 terrain_world_build_packet(
     const TerrainWorld *world,
@@ -565,6 +958,8 @@ terrain_world_build_packet(
         .feature_count = 0u,
         .overflow_count = 0u,
         .min_lod = UINT32_MAX,
+        .region_count = 0u,
+        .region_overflow_count = 0u,
     };
     packet.base.peak_count = 0u;
 
@@ -583,6 +978,19 @@ terrain_world_build_packet(
         }
     }
 
+    for (uint32_t i = 0u; i < world->region_count; i += 1u) {
+        const TerrainRegionNode *region = &world->regions[i];
+        if (!terrain_aabb_overlaps_xz(&region->effect_bbox, min_x, min_z, max_x, max_z)) {
+            continue;
+        }
+        if (packet.region_count >= TERRAIN_MAX_ACTIVE_REGIONS) {
+            packet.region_overflow_count += 1u;
+            continue;
+        }
+        packet.regions[packet.region_count++] = *region;
+    }
+    terrain_packet_sort_regions(&packet);
+
     *out_packet = packet;
-    return packet.overflow_count == 0u;
+    return packet.overflow_count == 0u && packet.region_overflow_count == 0u;
 }

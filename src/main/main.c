@@ -2,6 +2,8 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
 
 #include <log.h>
 
@@ -13,6 +15,7 @@
 #include "sparse_grid.h"
 #include "terrain_config.h"
 #include "terrain_gpu.h"
+#include "terrain_scene.h"
 
 #define SDL_MAIN_USE_CALLBACKS
 #include <SDL3/SDL.h>
@@ -89,6 +92,13 @@ typedef struct AppState {
 
     TerrainRegionConfig terrain_config;
     TerrainWorld terrain_world;
+    TerrainScene terrain_scene;
+    char scene_path[256];
+    uint64_t scene_mtime_ns;
+    char reload_status[32];
+    char reload_error[160];
+    uint32_t reload_invalidated_chunks;
+    bool palette_override;
 
     /* Chunk system: a pool of GPU pipelines indexed by cache record slots. */
     ChunkCache chunk_cache;
@@ -112,6 +122,7 @@ typedef struct AppState {
     uint32_t dbg_seam_only_changes;
     uint32_t dbg_seam_refreshes_skipped;
     uint32_t dbg_pipeline_recreates;
+    uint32_t dbg_current_regions;
     uint32_t dbg_resident;
     uint32_t dbg_queue;
     uint32_t dbg_evictions_total;
@@ -681,9 +692,20 @@ build_and_upload_hud(AppState *state, SDL_GPUCommandBuffer *command_buffer) {
     SDL_snprintf(
         line,
         sizeof(line),
-        "J/K HEIGHT %.1f / %.1f",
+        "SCENE %s",
+        state->terrain_scene.id
+    );
+    hud_emit_text(vertices, &count, x, y, scale, line);
+    y += line_step;
+
+    SDL_snprintf(
+        line,
+        sizeof(line),
+        "SEED %u HEIGHT %.0f %.0f BASE %.0f",
+        state->terrain_config.seed,
         state->terrain_config.min_height,
-        state->terrain_config.max_height
+        state->terrain_config.max_height,
+        state->terrain_config.base_height
     );
     hud_emit_text(vertices, &count, x, y, scale, line);
     y += line_step;
@@ -740,33 +762,37 @@ build_and_upload_hud(AppState *state, SDL_GPUCommandBuffer *command_buffer) {
     hud_emit_text(vertices, &count, x, y, scale, line);
     y += line_step;
 
-    SDL_snprintf(line, sizeof(line), "U/I WARP %.1f", state->terrain_config.warp_amount);
+    SDL_snprintf(line, sizeof(line), "NOISE OCT %u WARP %.1f F %.3f",
+                 state->terrain_config.basis_count > 0u ? state->terrain_config.basis_count : state->terrain_config.noise_octaves,
+                 state->terrain_config.warp_amount,
+                 state->terrain_config.basis_count > 0u ? state->terrain_config.basis[0].frequency : state->terrain_config.noise_frequency);
     hud_emit_text(vertices, &count, x, y, scale, line);
     y += line_step;
 
-    SDL_snprintf(line, sizeof(line), "N/M FREQ %.3f", state->terrain_config.noise_frequency);
+    SDL_snprintf(line, sizeof(line), "REGIONS %u ACTIVE %u", state->terrain_world.region_count, state->dbg_current_regions);
     hud_emit_text(vertices, &count, x, y, scale, line);
     y += line_step;
 
-    SDL_snprintf(line, sizeof(line), "[/] OCTAVES %u", state->terrain_config.noise_octaves);
+    SDL_snprintf(line, sizeof(line), "RELOAD %s INVALID %u", state->reload_status, state->reload_invalidated_chunks);
     hud_emit_text(vertices, &count, x, y, scale, line);
     y += line_step;
 
     SDL_snprintf(
         line,
         sizeof(line),
-        "P VIBE %s %u/%u",
+        "P VIBE %s %u/%u%s",
         palette_get(state->palette_index)->name,
         state->palette_index + 1u,
-        palette_count()
+        palette_count(),
+        state->palette_override ? " OVERRIDE" : ""
     );
     hud_emit_text(vertices, &count, x, y, scale, line);
     y += line_step;
 
     const char *help =
-        state->camera_mode == CAM_FLIGHT ? "W/S THROTTLE  A/D TURN  ARROWS PITCH/ROLL  P VIBE  R RESET" :
-        state->camera_mode == CAM_GROUND ? "WASD MOVE/TURN  MOUSE LOOK  SPACE JUMP  P VIBE  R RESET" :
-        "WASD MOVE  MMB UP/DOWN  P VIBE  ESC MOUSE  R RESET";
+        state->camera_mode == CAM_FLIGHT ? "W/S THROTTLE  A/D TURN  ARROWS PITCH/ROLL  P VIBE  R RELOAD/RESET" :
+        state->camera_mode == CAM_GROUND ? "WASD MOVE/TURN  MOUSE LOOK  SPACE JUMP  P VIBE  R RELOAD/RESET" :
+        "WASD MOVE  MMB UP/DOWN  P VIBE  ESC MOUSE  R RELOAD/RESET";
     hud_emit_text(vertices, &count, x, y, scale, help);
 
     SDL_UnmapGPUTransferBuffer(state->device, state->hud_transfer_buffer);
@@ -837,16 +863,83 @@ ensure_depth_texture(AppState *state, uint32_t width, uint32_t height) {
     return true;
 }
 
+static uint64_t
+file_mtime_ns(const char *path) {
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        return 0u;
+    }
+#if defined(__APPLE__)
+    return (uint64_t)st.st_mtimespec.tv_sec * 1000000000ull + (uint64_t)st.st_mtimespec.tv_nsec;
+#else
+    return (uint64_t)st.st_mtim.tv_sec * 1000000000ull + (uint64_t)st.st_mtim.tv_nsec;
+#endif
+}
+
+static void
+apply_scene(AppState *state, const TerrainScene *scene, bool update_palette) {
+    state->terrain_scene = *scene;
+    terrain_scene_apply_to_world(&state->terrain_scene, &state->terrain_world);
+    state->terrain_config = state->terrain_world.base;
+    state->density_version = state->terrain_scene.density_hash;
+    if (update_palette && !state->palette_override) {
+        state->palette_index = terrain_scene_palette_index(&state->terrain_scene);
+    }
+}
+
+static bool
+reload_scene(AppState *state, bool force) {
+    const uint64_t mtime = file_mtime_ns(state->scene_path);
+    if (!force && (mtime == 0u || mtime == state->scene_mtime_ns)) {
+        return true;
+    }
+
+    TerrainScene next = {0};
+    char error[160] = {0};
+    if (!terrain_scene_load_yaml(state->scene_path, &next, error, sizeof(error))) {
+        snprintf(state->reload_status, sizeof(state->reload_status), "ERROR");
+        snprintf(state->reload_error, sizeof(state->reload_error), "%s", error);
+        log_error("Scene reload failed: %s", error);
+        state->scene_mtime_ns = mtime;
+        return false;
+    }
+
+    const uint32_t old_density = state->terrain_scene.density_hash;
+    const uint32_t old_material = state->terrain_scene.material_hash;
+    const uint32_t old_graph = state->terrain_scene.graph_hash;
+    apply_scene(state, &next, true);
+    state->scene_mtime_ns = mtime;
+    snprintf(state->reload_status, sizeof(state->reload_status), "OK");
+    state->reload_error[0] = '\0';
+    state->reload_invalidated_chunks =
+        old_density != 0u && old_density != next.density_hash ? (uint32_t)state->active_count :
+        old_graph != 0u && old_graph != next.graph_hash ? (uint32_t)state->active_count :
+        0u;
+    if (old_material != 0u && old_material != next.material_hash && old_density == next.density_hash) {
+        state->reload_invalidated_chunks = 0u;
+    }
+    log_info(
+        "Loaded scene '%s' (%s): %u regions, density=%08x material=%08x graph=%08x",
+        state->terrain_scene.id,
+        state->terrain_scene.name,
+        state->terrain_world.region_count,
+        state->terrain_scene.density_hash,
+        state->terrain_scene.material_hash,
+        state->terrain_scene.graph_hash
+    );
+    return true;
+}
+
 static bool
 initialize_terrain(AppState *state) {
-    state->terrain_config = terrain_default_region_config();
-    terrain_world_init(&state->terrain_world, &state->terrain_config);
-    /* Demo features cluster around the region centre, where the camera starts
-     * and looks (see reset_camera), so authored features are visible on launch. */
-    const float cx = chunk_region_extent() * 0.5f;
-    const float cz = chunk_region_extent() * 0.5f;
-    terrain_world_add_demo_features(&state->terrain_world, cx, cz);
-    state->density_version = terrain_density_hash(&state->terrain_world.base);
+    const char *scene_path = getenv("TERRAGEN_SCENE");
+    snprintf(state->scene_path, sizeof(state->scene_path), "%s", scene_path != NULL ? scene_path : "res/scenes/mountain_valley.yaml");
+    snprintf(state->reload_status, sizeof(state->reload_status), "INIT");
+    if (!reload_scene(state, true)) {
+        TerrainScene fallback = terrain_scene_default();
+        apply_scene(state, &fallback, getenv("TERRAGEN_PALETTE") == NULL);
+        log_warn("Using built-in fallback terrain scene");
+    }
 
     state->pool_capacity = CHUNK_POOL_CAPACITY_DEFAULT;
     const char *pool_env = getenv("TERRAGEN_POOL");
@@ -900,12 +993,14 @@ generate_chunk(AppState *state, SDL_GPUCommandBuffer *command_buffer, ChunkRecor
     TerrainFieldPacket packet = {0};
     if (!field_packet_for_key(&state->terrain_world, key, &packet)) {
         log_error(
-            "Chunk %d,%d LOD %u has %u active terrain features over the packet cap %u",
+            "Chunk %d,%d LOD %u packet overflow: features %u/%u, regions %u/%u",
             key.cx,
             key.cz,
             key.lod,
             packet.overflow_count,
-            (unsigned)TERRAIN_MAX_ACTIVE_FEATURES
+            (unsigned)TERRAIN_MAX_ACTIVE_FEATURES,
+            packet.region_overflow_count,
+            (unsigned)TERRAIN_MAX_ACTIVE_REGIONS
         );
         return false;
     }
@@ -953,22 +1048,31 @@ chunk_system_update(AppState *state) {
     const float pov_x = state->camera_position[0];
     const float pov_z = state->camera_position[2];
 
-    /* Content-addressed density version: identical params reuse cached chunks
-     * exactly (so reverting a setting heals instantly), any change invalidates. */
-    state->terrain_world.base = state->terrain_config;
-    state->density_version = terrain_density_hash(&state->terrain_world.base);
+    /* Content-addressed density version comes from the hot-reloaded scene. */
+    state->density_version = state->terrain_scene.density_hash;
 
     state->active_count = chunk_active_set_hyst(
         pov_x, pov_z, CHUNK_REGION_TEST,
         state->density_version, 1u, materials_version_hash(), state->active_keys, CHUNK_MAX_ACTIVE,
         state->prev_active_keys, state->prev_active_count, CHUNK_LOD_HYSTERESIS
     );
+    state->dbg_current_regions = 0u;
     for (size_t i = 0u; i < state->active_count && i < CHUNK_MAX_ACTIVE; i += 1u) {
         TerrainFieldPacket packet = {0};
         if (field_packet_for_key(&state->terrain_world, state->active_keys[i], &packet)) {
             state->active_keys[i].density_version = terrain_field_packet_hash(&packet);
         } else {
-            state->active_keys[i].density_version = terrain_hash_u32(state->density_version ^ packet.overflow_count);
+            state->active_keys[i].density_version =
+                terrain_hash_u32(state->density_version ^ packet.overflow_count ^ packet.region_overflow_count);
+        }
+        const ChunkCoord coord = {
+            .cx = state->active_keys[i].cx,
+            .cz = state->active_keys[i].cz,
+            .lod = state->active_keys[i].lod,
+        };
+        const ChunkAabb2 b = chunk_bounds(coord);
+        if (pov_x >= b.min_x && pov_x < b.max_x && pov_z >= b.min_z && pov_z < b.max_z) {
+            state->dbg_current_regions = packet.region_count;
         }
     }
 
@@ -1181,15 +1285,25 @@ find_ground_y(const TerrainWorld *world, float x, float z) {
  * by SDL_AppInit and the R key. */
 static void
 reset_camera(AppState *state) {
-    state->camera_position[0] = chunk_region_extent() * 0.5f;
-    state->camera_position[1] = 34.0f;
-    state->camera_position[2] = chunk_region_extent() * 0.5f - 78.0f;
+    const float x = chunk_region_extent() * 0.5f;
+    const float z = chunk_region_extent() * 0.5f - 78.0f;
+    const float ground_y = find_ground_y(&state->terrain_world, x, z);
+    state->camera_position[0] = x;
+    state->camera_position[1] = ground_y + 42.0f;
+    state->camera_position[2] = z;
     state->camera_yaw = 0.0f;
-    state->camera_pitch = -0.24f;
+    state->camera_pitch = -0.32f;
     state->camera_fov_degrees = 60.0f;
     state->camera_roll = 0.0f;
     state->flight_speed = 0.0f;
     state->velocity_y = 0.0f;
+    log_info(
+        "Camera reset: pos %.1f %.1f %.1f, ground %.1f",
+        state->camera_position[0],
+        state->camera_position[1],
+        state->camera_position[2],
+        ground_y
+    );
 }
 
 static void
@@ -1379,11 +1493,9 @@ SDL_AppInit(void **appstate, int argc, char *argv[]) {
     const char *palette = getenv("TERRAGEN_PALETTE");
     if (palette != NULL) {
         state->palette_index = (uint32_t)SDL_atoi(palette) % palette_count();
+        state->palette_override = true;
     }
-    /* Overlook the region from near its center, matching the original gentle
-     * downward framing (camera above the terrain, looking across it). */
     state->camera_mode = CAM_FREE;
-    reset_camera(state);
     state->fps = 0.0f;
     state->last_frame_ticks = SDL_GetPerformanceCounter();
 
@@ -1436,6 +1548,9 @@ SDL_AppInit(void **appstate, int argc, char *argv[]) {
     if (!initialize_terrain(state)) {
         return SDL_APP_FAILURE;
     }
+    /* Overlook the region from near its center after the scene is loaded, so
+     * YAML-authored heights determine the spawn altitude. */
+    reset_camera(state);
     if (!SDL_SetWindowRelativeMouseMode(state->window, true)) {
         log_warn("Could not enable relative mouse mode: %s", SDL_GetError());
     }
@@ -1453,6 +1568,7 @@ SDL_AppIterate(void *appstate) {
     dt = clampf(dt, 0.0f, 0.1f);
     const float instant_fps = dt > 0.000001f ? 1.0f / dt : 0.0f;
     state->fps = state->fps <= 0.0f ? instant_fps : state->fps * 0.92f + instant_fps * 0.08f;
+    reload_scene(state, false);
     update_camera(state, dt);
     chunk_system_update(state);
 
@@ -1557,7 +1673,6 @@ SDL_AppEvent(void *appstate, SDL_Event *event) {
         return SDL_APP_CONTINUE;
     }
     if (event->type == SDL_EVENT_KEY_DOWN && !event->key.repeat) {
-        bool needs_regen = false;
         switch (event->key.key) {
             case SDLK_ESCAPE:
                 SDL_SetWindowRelativeMouseMode(state->window, !SDL_GetWindowRelativeMouseMode(state->window));
@@ -1584,68 +1699,29 @@ SDL_AppEvent(void *appstate, SDL_Event *event) {
                 }
                 break;
             case SDLK_R:
-                reset_camera(state);
+                if (reload_scene(state, true)) {
+                    reset_camera(state);
+                }
                 break;
             case SDLK_P:
                 /* Cycle the material palette ("vibe"). Resolved per-fragment, so
                  * no chunk regeneration is needed. */
                 state->palette_index = (state->palette_index + 1u) % palette_count();
+                state->palette_override = true;
                 log_info("Palette: %s", palette_get(state->palette_index)->name);
                 break;
             case SDLK_J:
-                state->terrain_config.max_height = clampf(
-                    state->terrain_config.max_height - 2.0f,
-                    state->terrain_config.min_height + 2.0f,
-                    48.0f
-                );
-                needs_regen = true;
-                break;
             case SDLK_K:
-                state->terrain_config.max_height = clampf(
-                    state->terrain_config.max_height + 2.0f,
-                    state->terrain_config.min_height + 2.0f,
-                    48.0f
-                );
-                needs_regen = true;
-                break;
             case SDLK_U:
-                state->terrain_config.warp_amount = clampf(state->terrain_config.warp_amount - 1.0f, 0.0f, 24.0f);
-                needs_regen = true;
-                break;
             case SDLK_I:
-                state->terrain_config.warp_amount = clampf(state->terrain_config.warp_amount + 1.0f, 0.0f, 24.0f);
-                needs_regen = true;
-                break;
             case SDLK_N:
-                state->terrain_config.noise_frequency = clampf(state->terrain_config.noise_frequency * 0.85f, 0.02f, 0.22f);
-                needs_regen = true;
-                break;
             case SDLK_M:
-                state->terrain_config.noise_frequency = clampf(state->terrain_config.noise_frequency * 1.18f, 0.02f, 0.22f);
-                needs_regen = true;
-                break;
             case SDLK_LEFTBRACKET:
-                if (state->terrain_config.noise_octaves > 1u) {
-                    state->terrain_config.noise_octaves -= 1u;
-                    needs_regen = true;
-                }
-                break;
             case SDLK_RIGHTBRACKET:
-                if (state->terrain_config.noise_octaves < 6u) {
-                    state->terrain_config.noise_octaves += 1u;
-                    needs_regen = true;
-                }
+                log_info("Terrain shaping hotkeys are disabled; edit %s", state->scene_path);
                 break;
             default:
                 break;
-        }
-
-        if (needs_regen) {
-            /* Refresh derived height fields; the density version is recomputed
-             * from the config each frame (content-addressed), so changed params
-             * invalidate chunks and reverted params reuse the cached ones. */
-            terrain_region_apply_height_range(&state->terrain_config);
-            state->terrain_world.base = state->terrain_config;
         }
     }
 

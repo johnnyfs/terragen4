@@ -10,13 +10,23 @@ layout(std140, set = 2, binding = 0) uniform TerrainParams {
     vec4 field;    // warp_amount, warp_freq, lacunarity, gain
     vec4 chunk;    // origin_x, origin_y, origin_z, skirt_depth
     ivec4 lmin;    // local_min_x, local_min_z, region_id, feature_count
-    ivec4 omin;    // owned_min_x, owned_min_y, owned_min_z, _
-    ivec4 odim;    // owned_dim_x, owned_dim_y, owned_dim_z, _
+    ivec4 omin;    // owned_min_x, owned_min_y, owned_min_z, region_count
+    ivec4 odim;    // owned_dim_x, owned_dim_y, owned_dim_z, basis_count
+    vec4 basis[8]; // kind, frequency, amplitude, sharpness
     ivec4 feature_meta[16]; // type, region, priority, min_lod
     vec4 feature_data0[16]; // pos_x, pos_y, pos_z, radius
     vec4 feature_data1[16]; // extent_x, extent_y, extent_z, intensity
     vec4 feature_data2[16]; // dir_x, dir_y, dir_z, sharpness
     vec4 feature_data3[16]; // falloff, material, _, _
+    ivec4 region_meta[16]; // geom, priority, influence_count, point_count
+    vec4 region_data0[16]; // center xyz, radius
+    vec4 region_data1[16]; // size xyz, rotation_y_degrees
+    vec4 region_data2[16]; // falloff, cutoff, mask_warp, _
+    vec4 region_min[16];
+    vec4 region_max[16];
+    ivec4 influence_meta[16][8]; // field, mode, octave, _
+    vec4 influence_data[16][8]; // value, target, strength, _
+    vec4 region_points[16][8];
 } params;
 
 struct CellSamples {

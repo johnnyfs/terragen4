@@ -25,6 +25,9 @@
 /* Number of LOD levels (0 = finest). */
 #define CHUNK_LOD_COUNT 3u
 
+/* Desired max edge-adjacent LOD delta for the active-set selector. */
+#define CHUNK_MAX_LOD_DELTA 1u
+
 /* World units per cell at LOD 0. */
 #define CHUNK_BASE_CELL_SIZE 1.0f
 

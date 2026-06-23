@@ -6,7 +6,7 @@
 #include "gpu_shader.h"
 #include "log.h"
 
-#define CHUNK_SKIRTS_ENABLED 1
+#define CHUNK_SKIRT_ENABLED 1
 #define CHUNK_SKIRT_POLICY_ALWAYS 1
 #define CHUNK_SKIRT_DEPTH_CELLS 2.0f
 
@@ -19,11 +19,21 @@ typedef struct TerrainGpuParams {
     int32_t lmin[4];     /* local_min_x, local_min_z, region_id, feature_count */
     int32_t omin[4];     /* owned_min_x, owned_min_y, owned_min_z, _ */
     int32_t odim[4];     /* owned_dim_x, owned_dim_y, owned_dim_z, _ */
+    float basis[TERRAIN_MAX_NOISE_OCTAVES][4]; /* kind, frequency, amplitude, sharpness */
     int32_t feature_meta[TERRAIN_MAX_ACTIVE_FEATURES][4]; /* type, region, priority, min_lod */
     float feature_data0[TERRAIN_MAX_ACTIVE_FEATURES][4];  /* pos_x, pos_y, pos_z, radius */
     float feature_data1[TERRAIN_MAX_ACTIVE_FEATURES][4];  /* extent_x, extent_y, extent_z, intensity */
     float feature_data2[TERRAIN_MAX_ACTIVE_FEATURES][4];  /* dir_x, dir_y, dir_z, sharpness */
     float feature_data3[TERRAIN_MAX_ACTIVE_FEATURES][4];  /* falloff, material, _, _ */
+    int32_t region_meta[TERRAIN_MAX_ACTIVE_REGIONS][4]; /* geom, priority, influence_count, point_count */
+    float region_data0[TERRAIN_MAX_ACTIVE_REGIONS][4];  /* center xyz, radius */
+    float region_data1[TERRAIN_MAX_ACTIVE_REGIONS][4];  /* size xyz, rotation_y_degrees */
+    float region_data2[TERRAIN_MAX_ACTIVE_REGIONS][4];  /* falloff, cutoff, mask_warp, _ */
+    float region_min[TERRAIN_MAX_ACTIVE_REGIONS][4];    /* effect bbox min */
+    float region_max[TERRAIN_MAX_ACTIVE_REGIONS][4];    /* effect bbox max */
+    int32_t influence_meta[TERRAIN_MAX_ACTIVE_REGIONS][TERRAIN_MAX_REGION_INFLUENCES][4]; /* field, mode, octave, _ */
+    float influence_data[TERRAIN_MAX_ACTIVE_REGIONS][TERRAIN_MAX_REGION_INFLUENCES][4];   /* value, target, strength, _ */
+    float region_points[TERRAIN_MAX_ACTIVE_REGIONS][TERRAIN_MAX_REGION_POINTS][4];
 } TerrainGpuParams;
 
 typedef struct CellSamplesGpu {
@@ -61,7 +71,7 @@ make_params(const TerrainGpuPipeline *pipeline) {
     const uint32_t feature_count = packet->feature_count < TERRAIN_MAX_ACTIVE_FEATURES
         ? packet->feature_count
         : TERRAIN_MAX_ACTIVE_FEATURES;
-#if CHUNK_SKIRTS_ENABLED && CHUNK_SKIRT_POLICY_ALWAYS
+#if CHUNK_SKIRT_ENABLED && CHUNK_SKIRT_POLICY_ALWAYS
     const float skirt_depth = layout->cell_size * CHUNK_SKIRT_DEPTH_CELLS;
 #else
     const float skirt_depth = 0.0f;
@@ -106,6 +116,14 @@ make_params(const TerrainGpuPipeline *pipeline) {
         },
         .odim = {layout->owned_dim_x, layout->owned_dim_y, layout->owned_dim_z, 0},
     };
+    params.odim[3] = (int32_t)(config->basis_count < TERRAIN_MAX_NOISE_OCTAVES ? config->basis_count : TERRAIN_MAX_NOISE_OCTAVES);
+    params.omin[3] = (int32_t)(packet->region_count < TERRAIN_MAX_ACTIVE_REGIONS ? packet->region_count : TERRAIN_MAX_ACTIVE_REGIONS);
+    for (uint32_t i = 0u; i < config->basis_count && i < TERRAIN_MAX_NOISE_OCTAVES; i += 1u) {
+        params.basis[i][0] = (float)config->basis[i].kind;
+        params.basis[i][1] = config->basis[i].frequency;
+        params.basis[i][2] = config->basis[i].amplitude;
+        params.basis[i][3] = config->basis[i].sharpness;
+    }
     for (uint32_t i = 0u; i < feature_count; i += 1u) {
         const TerrainFeature *feature = &packet->features[i];
         params.feature_meta[i][0] = (int32_t)feature->type;
@@ -126,6 +144,45 @@ make_params(const TerrainGpuPipeline *pipeline) {
         params.feature_data2[i][3] = feature->sharpness;
         params.feature_data3[i][0] = feature->falloff;
         params.feature_data3[i][1] = feature->material;
+    }
+    const uint32_t region_count = packet->region_count < TERRAIN_MAX_ACTIVE_REGIONS
+        ? packet->region_count
+        : TERRAIN_MAX_ACTIVE_REGIONS;
+    for (uint32_t i = 0u; i < region_count; i += 1u) {
+        const TerrainRegionNode *region = &packet->regions[i];
+        params.region_meta[i][0] = (int32_t)region->geometry.type;
+        params.region_meta[i][1] = (int32_t)region->priority;
+        params.region_meta[i][2] = (int32_t)region->influence_count;
+        params.region_meta[i][3] = (int32_t)region->geometry.point_count;
+        params.region_data0[i][0] = region->geometry.center[0];
+        params.region_data0[i][1] = region->geometry.center[1];
+        params.region_data0[i][2] = region->geometry.center[2];
+        params.region_data0[i][3] = region->geometry.radius;
+        params.region_data1[i][0] = region->geometry.size[0];
+        params.region_data1[i][1] = region->geometry.size[1];
+        params.region_data1[i][2] = region->geometry.size[2];
+        params.region_data1[i][3] = region->geometry.rotation_y_degrees;
+        params.region_data2[i][0] = region->transition_falloff;
+        params.region_data2[i][1] = region->cutoff_epsilon;
+        params.region_data2[i][2] = region->geometry.mask_warp;
+        for (uint32_t a = 0u; a < 3u; a += 1u) {
+            params.region_min[i][a] = region->effect_bbox.min[a];
+            params.region_max[i][a] = region->effect_bbox.max[a];
+        }
+        for (uint32_t p = 0u; p < region->geometry.point_count && p < TERRAIN_MAX_REGION_POINTS; p += 1u) {
+            params.region_points[i][p][0] = region->geometry.points[p][0];
+            params.region_points[i][p][1] = region->geometry.points[p][1];
+            params.region_points[i][p][2] = region->geometry.points[p][2];
+        }
+        for (uint32_t j = 0u; j < region->influence_count && j < TERRAIN_MAX_REGION_INFLUENCES; j += 1u) {
+            const TerrainRegionInfluence *influence = &region->influences[j];
+            params.influence_meta[i][j][0] = (int32_t)influence->field;
+            params.influence_meta[i][j][1] = (int32_t)influence->mode;
+            params.influence_meta[i][j][2] = influence->octave_index;
+            params.influence_data[i][j][0] = influence->value;
+            params.influence_data[i][j][1] = influence->target;
+            params.influence_data[i][j][2] = influence->strength;
+        }
     }
     return params;
 }

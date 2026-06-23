@@ -118,3 +118,16 @@ target_compile_options(chunk_cache_tests PUBLIC -std=c23 -Wall -Wfloat-conversio
 target_include_directories(chunk_cache_tests PUBLIC src/main)
 target_link_libraries(chunk_cache_tests m)
 add_test(NAME chunk_cache_tests COMMAND chunk_cache_tests)
+
+add_executable(terrain_scene_tests
+    src/test/terrain_scene_tests.c
+    src/main/chunk_coord.c
+    src/main/materials.c
+    src/main/terrain_config.c
+    src/main/terrain_scene.c
+)
+target_compile_options(terrain_scene_tests PUBLIC -std=c23 -Wall -Wfloat-conversion)
+target_include_directories(terrain_scene_tests PUBLIC src/main)
+target_link_libraries(terrain_scene_tests m)
+add_test(NAME terrain_scene_tests COMMAND terrain_scene_tests)
+set_tests_properties(terrain_scene_tests PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
