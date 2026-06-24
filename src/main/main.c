@@ -1,3 +1,7 @@
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include <math.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -873,8 +877,12 @@ file_mtime_ns(const char *path) {
     }
 #if defined(__APPLE__)
     return (uint64_t)st.st_mtimespec.tv_sec * 1000000000ull + (uint64_t)st.st_mtimespec.tv_nsec;
-#else
+#elif defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__)
+    return (uint64_t)st.st_mtimespec.tv_sec * 1000000000ull + (uint64_t)st.st_mtimespec.tv_nsec;
+#elif defined(__linux__)
     return (uint64_t)st.st_mtim.tv_sec * 1000000000ull + (uint64_t)st.st_mtim.tv_nsec;
+#else
+    return (uint64_t)st.st_mtime * 1000000000ull;
 #endif
 }
 
