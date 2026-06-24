@@ -14,7 +14,11 @@ next_pow2(size_t n) {
 static bool
 key_in_active(const ChunkGenKey *active, size_t active_count, const ChunkGenKey *key) {
     for (size_t i = 0u; i < active_count; i += 1u) {
-        if (chunk_genkey_equals(&active[i], key)) {
+        if (chunk_genkey_equals(&active[i], key) ||
+            (active[i].region_id == key->region_id &&
+             active[i].cx == key->cx &&
+             active[i].cz == key->cz &&
+             active[i].lod == key->lod)) {
             return true;
         }
     }
@@ -77,6 +81,27 @@ chunk_cache_find(ChunkCache *cache, const ChunkGenKey *key) {
         idx = (idx + 1u) & mask;
     }
     return NULL;
+}
+
+ChunkRecord *
+chunk_cache_find_ready_geometry(ChunkCache *cache, const ChunkGenKey *key) {
+    ChunkRecord *best = NULL;
+    for (size_t i = 0u; i < cache->table_capacity; i += 1u) {
+        ChunkRecord *rec = &cache->table[i];
+        if (!rec->occupied || rec->status != CHUNK_STATUS_READY) {
+            continue;
+        }
+        if (rec->key.region_id != key->region_id ||
+            rec->key.cx != key->cx ||
+            rec->key.cz != key->cz ||
+            rec->key.lod != key->lod) {
+            continue;
+        }
+        if (best == NULL || rec->last_used_frame > best->last_used_frame) {
+            best = rec;
+        }
+    }
+    return best;
 }
 
 ChunkRecord *

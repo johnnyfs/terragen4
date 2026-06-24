@@ -57,6 +57,7 @@ void chunk_cache_clear(ChunkCache *cache);
 
 /* Lookup; returns the live record or NULL. */
 ChunkRecord *chunk_cache_find(ChunkCache *cache, const ChunkGenKey *key);
+ChunkRecord *chunk_cache_find_ready_geometry(ChunkCache *cache, const ChunkGenKey *key);
 
 /*
  * Reserve a record + resource slot for key (status QUEUED). Returns the record,

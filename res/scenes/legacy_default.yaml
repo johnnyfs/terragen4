@@ -1,0 +1,36 @@
+version: 1
+
+scene:
+  id: legacy_default
+  name: "Legacy Default"
+
+  world:
+    region_size_chunks: 24
+    base_cell_size: 1.0
+    chunk_cells: 24
+    lod_count: 3
+
+  height:
+    min: -8.0
+    max: 18.0
+    base: 5.0
+
+  noise:
+    seed: 1337
+    legacy:
+      frequency: 0.085
+      amplitude: 13.0
+      octaves: 4
+      lacunarity: 2.05
+      gain: 0.48
+
+  warp:
+    frequency: 0.055
+    amplitude: 6.0
+
+  material:
+    default_vibe: Meadow
+    default_flat_material: grass
+    default_slope_material: stone
+
+regions: []

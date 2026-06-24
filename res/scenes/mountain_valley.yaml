@@ -11,36 +11,42 @@ scene:
     lod_count: 3
 
   height:
-    min: -32
-    max: 280
-    base: 24
+    min: -8.0
+    max: 18.0
+    base: 5.0
 
   noise:
-    seed: 12345
+    seed: 1337
+    legacy:
+      frequency: 0.085
+      amplitude: 13.0
+      octaves: 4
+      lacunarity: 2.05
+      gain: 0.48
     octaves:
       - name: macro
         kind: fbm
-        frequency: 0.215
-        amplitude: 48.0
+        frequency: 0.032
+        amplitude: 16.0
       - name: forms
         kind: fbm
-        frequency: 0.055
-        amplitude: 20.0
+        frequency: 0.085
+        amplitude: 8.0
       - name: detail
         kind: fbm
         frequency: 0.14
-        amplitude: 7.0
+        amplitude: 3.0
       - name: ridges
         kind: ridged
         frequency: 0.075
-        amplitude: 16.0
+        amplitude: 6.0
         sharpness: 1.15
     lacunarity: 2.05
     gain: 0.48
 
   warp:
-    frequency: 0.035
-    amplitude: 8.0
+    frequency: 0.055
+    amplitude: 6.0
 
   material:
     default_vibe: Meadow
@@ -52,8 +58,8 @@ regions:
     kind: mountain
     geometry:
       type: box
-      center: [288, 100, 288]
-      size: [760, 520, 760]
+      center: [288, 5, 288]
+      size: [760, 320, 760]
       edge_noise: 0.0
     transition:
       type: smoothstep
@@ -63,7 +69,7 @@ regions:
     influences:
       - field: height
         mode: add
-        value: 110
+        value: 22
       - field: octave_amplitude
         octave: ridges
         mode: multiply
@@ -79,10 +85,10 @@ regions:
     geometry:
       type: capsule_path
       points:
-        - [68, 42, 408]
-        - [188, 36, 326]
-        - [328, 32, 264]
-        - [508, 28, 148]
+        - [68, 5, 408]
+        - [188, 5, 326]
+        - [328, 4, 264]
+        - [508, 3, 148]
       radius: 140
       mask_warp: 0.0
     transition:
@@ -93,7 +99,7 @@ regions:
     influences:
       - field: height
         mode: pull_to_target
-        target: 34
+        target: 3
         strength: 0.86
       - field: octave_amplitude
         octave: ridges
@@ -110,8 +116,8 @@ regions:
     allow_outside_parent: true
     geometry:
       type: oriented_box
-      center: [356, 88, 252]
-      size: [170, 86, 132]
+      center: [356, 12, 252]
+      size: [170, 18, 132]
       rotation_y: -14
     transition:
       type: smoothstep
@@ -121,7 +127,7 @@ regions:
     influences:
       - field: height
         mode: pull_to_target
-        target: 96
+        target: 24
         strength: 0.94
       - field: octave_amplitude
         octave: detail
@@ -139,10 +145,10 @@ regions:
     geometry:
       type: capsule_path
       points:
-        - [356, 96, 252]
-        - [320, 76, 288]
-        - [266, 54, 320]
-        - [202, 38, 338]
+        - [356, 24, 252]
+        - [320, 16, 288]
+        - [266, 8, 320]
+        - [202, 5, 338]
       radius: 20
       mask_warp: 0.0
     transition:
@@ -170,10 +176,10 @@ regions:
     geometry:
       type: capsule_path
       points:
-        - [116, 46, 392]
-        - [218, 36, 310]
-        - [338, 30, 238]
-        - [476, 24, 132]
+        - [116, 5, 392]
+        - [218, 4, 310]
+        - [338, 3, 238]
+        - [476, 2, 132]
       radius: 28
       mask_warp: 0.0
     transition:
@@ -184,7 +190,7 @@ regions:
     influences:
       - field: height
         mode: add
-        value: -18
+        value: -8
       - field: octave_amplitude
         octave: detail
         mode: multiply

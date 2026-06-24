@@ -79,6 +79,34 @@ typedef enum {
 #define CAM_FLIGHT_ROLL_MAX 1.2f
 #define CAM_NEAR_Z 0.25f
 #define CAM_FAR_Z 4096.0f
+#define TERRAGEN_DEFAULT_SCENE "res/scenes/legacy_default.yaml"
+
+typedef enum TerrainOverrideMask {
+    TERRAIN_OVERRIDE_MIN_HEIGHT = 1u << 0u,
+    TERRAIN_OVERRIDE_MAX_HEIGHT = 1u << 1u,
+    TERRAIN_OVERRIDE_BASE_HEIGHT = 1u << 2u,
+    TERRAIN_OVERRIDE_NOISE_FREQUENCY = 1u << 3u,
+    TERRAIN_OVERRIDE_NOISE_AMPLITUDE = 1u << 4u,
+    TERRAIN_OVERRIDE_NOISE_OCTAVES = 1u << 5u,
+    TERRAIN_OVERRIDE_NOISE_LACUNARITY = 1u << 6u,
+    TERRAIN_OVERRIDE_NOISE_GAIN = 1u << 7u,
+    TERRAIN_OVERRIDE_WARP_AMOUNT = 1u << 8u,
+    TERRAIN_OVERRIDE_WARP_FREQUENCY = 1u << 9u,
+    TERRAIN_OVERRIDE_SEED = 1u << 10u,
+} TerrainOverrideMask;
+
+typedef struct RuntimeTerrainOverrides {
+    uint32_t mask;
+    TerrainRegionConfig values;
+} RuntimeTerrainOverrides;
+
+typedef struct AppOptions {
+    char scene_path[256];
+    bool auto_hot_reload;
+    uint32_t reload_interval_ms;
+    bool show_help;
+    bool sample_check;
+} AppOptions;
 
 typedef struct AppState {
     SDL_Window *window;
@@ -97,13 +125,21 @@ typedef struct AppState {
     uint32_t hud_vertex_count;
 
     TerrainRegionConfig terrain_config;
+    TerrainRegionConfig loaded_terrain_config;
+    RuntimeTerrainOverrides terrain_overrides;
     TerrainWorld terrain_world;
     TerrainScene terrain_scene;
     char scene_path[256];
     uint64_t scene_mtime_ns;
+    uint64_t last_reload_check_ms;
+    uint32_t reload_interval_ms;
+    uint32_t reload_frame;
+    uint32_t reload_hash;
     char reload_status[32];
     char reload_error[160];
     uint32_t reload_invalidated_chunks;
+    bool auto_hot_reload;
+    bool scene_fallback_builtin;
     bool palette_override;
 
     /* Chunk system: a pool of GPU pipelines indexed by cache record slots. */
@@ -134,6 +170,11 @@ typedef struct AppState {
     uint32_t dbg_evictions_total;
     uint32_t dbg_generated_total;
     uint32_t dbg_lod[CHUNK_LOD_COUNT];
+    uint32_t dbg_exact_rendered;
+    uint32_t dbg_stale_rendered;
+    uint32_t dbg_fallback_ancestor_rendered;
+    uint32_t dbg_fallback_child_rendered;
+    uint32_t dbg_blank_chunks;
 
     uint32_t frame_count;
     uint32_t smoke_frame_limit;
@@ -169,6 +210,225 @@ clampf(float value, float min_value, float max_value) {
         return max_value;
     }
     return value;
+}
+
+static void
+print_usage(void) {
+    printf(
+        "Usage: terragen [options]\n"
+        "  --scene <path>     Load terrain scene YAML\n"
+        "  --no-hot-reload    Disable automatic scene reload\n"
+        "  --reload-ms <n>    Scene reload polling interval\n"
+        "  --sample-check     Print CPU terrain sample diagnostics and exit\n"
+        "  --help             Show this help\n"
+    );
+}
+
+static AppOptions
+parse_options(int argc, char *argv[]) {
+    AppOptions options = {
+        .auto_hot_reload = true,
+        .reload_interval_ms = 250u,
+    };
+    const char *env_scene = getenv("TERRAGEN_SCENE");
+    snprintf(options.scene_path, sizeof(options.scene_path), "%s", env_scene != NULL ? env_scene : TERRAGEN_DEFAULT_SCENE);
+    for (int i = 1; i < argc; i += 1) {
+        if (strcmp(argv[i], "--help") == 0) {
+            options.show_help = true;
+        } else if (strcmp(argv[i], "--scene") == 0 && i + 1 < argc) {
+            snprintf(options.scene_path, sizeof(options.scene_path), "%s", argv[++i]);
+        } else if (strcmp(argv[i], "--no-hot-reload") == 0) {
+            options.auto_hot_reload = false;
+        } else if (strcmp(argv[i], "--reload-ms") == 0 && i + 1 < argc) {
+            const int ms = atoi(argv[++i]);
+            if (ms > 0) {
+                options.reload_interval_ms = (uint32_t)ms;
+            }
+        } else if (strcmp(argv[i], "--sample-check") == 0) {
+            options.sample_check = true;
+        }
+    }
+    return options;
+}
+
+static TerrainRegionConfig
+effective_config_from_overrides(const TerrainRegionConfig *loaded, const RuntimeTerrainOverrides *overrides) {
+    TerrainRegionConfig config = *loaded;
+    const uint32_t mask = overrides->mask;
+    if ((mask & TERRAIN_OVERRIDE_MIN_HEIGHT) != 0u) { config.min_height = overrides->values.min_height; }
+    if ((mask & TERRAIN_OVERRIDE_MAX_HEIGHT) != 0u) { config.max_height = overrides->values.max_height; }
+    if (config.basis_count == 0u &&
+        (mask & (TERRAIN_OVERRIDE_MIN_HEIGHT | TERRAIN_OVERRIDE_MAX_HEIGHT)) != 0u &&
+        (mask & (TERRAIN_OVERRIDE_BASE_HEIGHT | TERRAIN_OVERRIDE_NOISE_AMPLITUDE)) !=
+            (TERRAIN_OVERRIDE_BASE_HEIGHT | TERRAIN_OVERRIDE_NOISE_AMPLITUDE)) {
+        terrain_region_apply_height_range(&config);
+    }
+    if ((mask & TERRAIN_OVERRIDE_BASE_HEIGHT) != 0u) { config.base_height = overrides->values.base_height; }
+    if ((mask & TERRAIN_OVERRIDE_NOISE_FREQUENCY) != 0u) { config.noise_frequency = overrides->values.noise_frequency; }
+    if ((mask & TERRAIN_OVERRIDE_NOISE_AMPLITUDE) != 0u) { config.noise_amplitude = overrides->values.noise_amplitude; }
+    if ((mask & TERRAIN_OVERRIDE_NOISE_OCTAVES) != 0u) { config.noise_octaves = overrides->values.noise_octaves; }
+    if ((mask & TERRAIN_OVERRIDE_NOISE_LACUNARITY) != 0u) { config.noise_lacunarity = overrides->values.noise_lacunarity; }
+    if ((mask & TERRAIN_OVERRIDE_NOISE_GAIN) != 0u) { config.noise_gain = overrides->values.noise_gain; }
+    if ((mask & TERRAIN_OVERRIDE_WARP_AMOUNT) != 0u) { config.warp_amount = overrides->values.warp_amount; }
+    if ((mask & TERRAIN_OVERRIDE_WARP_FREQUENCY) != 0u) { config.warp_frequency = overrides->values.warp_frequency; }
+    if ((mask & TERRAIN_OVERRIDE_SEED) != 0u) { config.seed = overrides->values.seed; }
+    return config;
+}
+
+static void
+format_override_names(uint32_t mask, char *out, size_t out_size) {
+    if (out_size == 0u) {
+        return;
+    }
+    out[0] = '\0';
+    if (mask == 0u) {
+        snprintf(out, out_size, "OFF");
+        return;
+    }
+    const struct {
+        uint32_t bit;
+        const char *name;
+    } names[] = {
+        {TERRAIN_OVERRIDE_MIN_HEIGHT, "min"},
+        {TERRAIN_OVERRIDE_MAX_HEIGHT, "max"},
+        {TERRAIN_OVERRIDE_BASE_HEIGHT, "base"},
+        {TERRAIN_OVERRIDE_NOISE_FREQUENCY, "freq"},
+        {TERRAIN_OVERRIDE_NOISE_AMPLITUDE, "amp"},
+        {TERRAIN_OVERRIDE_NOISE_OCTAVES, "oct"},
+        {TERRAIN_OVERRIDE_NOISE_LACUNARITY, "lac"},
+        {TERRAIN_OVERRIDE_NOISE_GAIN, "gain"},
+        {TERRAIN_OVERRIDE_WARP_AMOUNT, "warp"},
+        {TERRAIN_OVERRIDE_WARP_FREQUENCY, "warp_f"},
+        {TERRAIN_OVERRIDE_SEED, "seed"},
+    };
+    snprintf(out, out_size, "ON:");
+    for (size_t i = 0u; i < sizeof(names) / sizeof(names[0]); i += 1u) {
+        if ((mask & names[i].bit) == 0u) {
+            continue;
+        }
+        const size_t len = strlen(out);
+        snprintf(out + len, out_size > len ? out_size - len : 0u, " %s", names[i].name);
+    }
+}
+
+static void
+log_scene_summary(const char *path, const TerrainScene *scene) {
+    const TerrainRegionConfig *config = &scene->world_data.base;
+    log_info(
+        "loaded scene path=%s id=%s min=%.2f max=%.2f base=%.2f legacy_freq=%.4f legacy_amp=%.2f "
+        "octaves=%u basis_count=%u warp=%.3f/%.2f regions=%u density_hash=%08x material_hash=%08x graph_hash=%08x",
+        path,
+        scene->id,
+        config->min_height,
+        config->max_height,
+        config->base_height,
+        config->noise_frequency,
+        config->noise_amplitude,
+        config->noise_octaves,
+        config->basis_count,
+        config->warp_frequency,
+        config->warp_amount,
+        scene->world_data.region_count,
+        scene->density_hash,
+        scene->material_hash,
+        scene->graph_hash
+    );
+    for (uint32_t i = 0u; i < config->basis_count && i < TERRAIN_MAX_NOISE_OCTAVES; i += 1u) {
+        log_info(
+            "  octave %u name=%s kind=%u freq=%.4f amp=%.2f sharp=%.2f",
+            i,
+            config->basis[i].name,
+            (unsigned)config->basis[i].kind,
+            config->basis[i].frequency,
+            config->basis[i].amplitude,
+            config->basis[i].sharpness
+        );
+    }
+}
+
+static void
+rebuild_effective_terrain(AppState *state) {
+    state->terrain_world = state->terrain_scene.world_data;
+    state->loaded_terrain_config = state->terrain_scene.world_data.base;
+    state->terrain_config = effective_config_from_overrides(&state->loaded_terrain_config, &state->terrain_overrides);
+    state->terrain_world.base = state->terrain_config;
+    state->density_version = terrain_density_hash(&state->terrain_world.base);
+}
+
+static void
+set_override_float(AppState *state, uint32_t bit, float value, float *slot) {
+    state->terrain_overrides.mask |= bit;
+    *slot = value;
+    rebuild_effective_terrain(state);
+}
+
+static void
+set_override_u32(AppState *state, uint32_t bit, uint32_t value, uint32_t *slot) {
+    state->terrain_overrides.mask |= bit;
+    *slot = value;
+    rebuild_effective_terrain(state);
+}
+
+static int
+run_sample_check(const char *path) {
+    TerrainScene scene = {0};
+    char error[160] = {0};
+    if (!terrain_scene_load_yaml(path, &scene, error, sizeof(error))) {
+        fprintf(stderr, "sample-check scene load failed path=%s error=%s\n", path, error);
+        return 1;
+    }
+    log_scene_summary(path, &scene);
+    printf("sample-check path=%s id=%s\n", path, scene.id);
+    printf(
+        "config min=%.2f max=%.2f base=%.2f freq=%.4f amp=%.2f oct=%u lac=%.2f gain=%.2f warp=%.3f/%.2f basis=%u regions=%u features=%u density=%08x\n",
+        scene.world_data.base.min_height,
+        scene.world_data.base.max_height,
+        scene.world_data.base.base_height,
+        scene.world_data.base.noise_frequency,
+        scene.world_data.base.noise_amplitude,
+        scene.world_data.base.noise_octaves,
+        scene.world_data.base.noise_lacunarity,
+        scene.world_data.base.noise_gain,
+        scene.world_data.base.warp_frequency,
+        scene.world_data.base.warp_amount,
+        scene.world_data.base.basis_count,
+        scene.world_data.region_count,
+        scene.world_data.feature_count,
+        scene.density_hash
+    );
+    const float samples[][2] = {
+        {128.0f, 128.0f},
+        {288.0f, 288.0f},
+        {356.0f, 252.0f},
+        {476.0f, 132.0f},
+    };
+    for (size_t i = 0u; i < sizeof(samples) / sizeof(samples[0]); i += 1u) {
+        TerrainFieldPacket packet = {0};
+        const float x = samples[i][0];
+        const float z = samples[i][1];
+        (void)terrain_world_build_packet(&scene.world_data, CHUNK_REGION_TEST, x, z, x, z, &packet);
+        const float surface = terrain_field_surface_height_sample(&packet, x, z);
+        const float density = terrain_field_density_sample(&packet, x, surface, z);
+        const ChunkCoord coord = chunk_from_world(0u, x, z);
+        const ChunkLayout layout = sparse_grid_chunk_layout_packet(&packet, coord.lod, coord.cx, coord.cz);
+        printf(
+            "sample x=%.1f z=%.1f surface=%.3f density=%.6f chunk=%d,%d,lod%u local_min_y=%d array_dim_y=%d cells=%d packet_basis=%u packet_regions=%u packet_features=%u\n",
+            x,
+            z,
+            surface,
+            density,
+            coord.cx,
+            coord.cz,
+            coord.lod,
+            layout.local_min_y,
+            layout.array_dim_y,
+            layout.array_dim_x * layout.array_dim_y * layout.array_dim_z,
+            packet.base.basis_count,
+            packet.region_count,
+            packet.feature_count
+        );
+    }
+    return 0;
 }
 
 static void
@@ -698,32 +958,45 @@ build_and_upload_hud(AppState *state, SDL_GPUCommandBuffer *command_buffer) {
     SDL_snprintf(
         line,
         sizeof(line),
-        "SCENE %s",
+        "%sSCENE %s",
+        state->scene_fallback_builtin ? "SCENE LOAD FAILED - USING BUILTIN DEFAULT  " : "",
         state->terrain_scene.id
     );
     hud_emit_text(vertices, &count, x, y, scale, line);
     y += line_step;
 
-    SDL_snprintf(
-        line,
-        sizeof(line),
-        "SEED %u HEIGHT %.0f %.0f BASE %.0f",
-        state->terrain_config.seed,
-        state->terrain_config.min_height,
-        state->terrain_config.max_height,
-        state->terrain_config.base_height
-    );
+    SDL_snprintf(line, sizeof(line), "YAML %.112s", state->scene_path);
     hud_emit_text(vertices, &count, x, y, scale, line);
     y += line_step;
 
     SDL_snprintf(
         line,
         sizeof(line),
-        "CHUNKS A%u R%u  RES %u/%u",
+        "SEED %u HEIGHT %.0f %.0f BASE %.0f AMP %.1f",
+        state->terrain_config.seed,
+        state->terrain_config.min_height,
+        state->terrain_config.max_height,
+        state->terrain_config.base_height,
+        state->terrain_config.noise_amplitude
+    );
+    hud_emit_text(vertices, &count, x, y, scale, line);
+    y += line_step;
+
+    char overrides[96] = {0};
+    format_override_names(state->terrain_overrides.mask, overrides, sizeof(overrides));
+    SDL_snprintf(line, sizeof(line), "OVERRIDE %s", overrides);
+    hud_emit_text(vertices, &count, x, y, scale, line);
+    y += line_step;
+
+    SDL_snprintf(
+        line,
+        sizeof(line),
+        "CHUNKS A%u R%u X%u S%u BLANK%u",
         state->dbg_active,
         state->dbg_rendered,
-        state->dbg_resident,
-        (unsigned)state->pool_capacity
+        state->dbg_exact_rendered,
+        state->dbg_stale_rendered,
+        state->dbg_blank_chunks
     );
     hud_emit_text(vertices, &count, x, y, scale, line);
     y += line_step;
@@ -779,9 +1052,23 @@ build_and_upload_hud(AppState *state, SDL_GPUCommandBuffer *command_buffer) {
     hud_emit_text(vertices, &count, x, y, scale, line);
     y += line_step;
 
-    SDL_snprintf(line, sizeof(line), "RELOAD %s INVALID %u", state->reload_status, state->reload_invalidated_chunks);
+    SDL_snprintf(
+        line,
+        sizeof(line),
+        "RELOAD %s F%u H%08x INVALID %u",
+        state->reload_status,
+        state->reload_frame,
+        state->reload_hash,
+        state->reload_invalidated_chunks
+    );
     hud_emit_text(vertices, &count, x, y, scale, line);
     y += line_step;
+
+    if (state->reload_error[0] != '\0') {
+        SDL_snprintf(line, sizeof(line), "RELOAD ERROR: %.112s", state->reload_error);
+        hud_emit_text(vertices, &count, x, y, scale, line);
+        y += line_step;
+    }
 
     SDL_snprintf(
         line,
@@ -796,9 +1083,9 @@ build_and_upload_hud(AppState *state, SDL_GPUCommandBuffer *command_buffer) {
     y += line_step;
 
     const char *help =
-        state->camera_mode == CAM_FLIGHT ? "W/S THROTTLE  A/D TURN  ARROWS PITCH/ROLL  P VIBE  R RELOAD/RESET" :
-        state->camera_mode == CAM_GROUND ? "WASD MOVE/TURN  MOUSE LOOK  SPACE JUMP  P VIBE  R RELOAD/RESET" :
-        "WASD MOVE  MMB UP/DOWN  P VIBE  ESC MOUSE  R RELOAD/RESET";
+        state->camera_mode == CAM_FLIGHT ? "W/S THROTTLE  A/D TURN  ARROWS PITCH/ROLL  P VIBE  R RESET  F5 RELOAD" :
+        state->camera_mode == CAM_GROUND ? "WASD MOVE/TURN  MOUSE LOOK  SPACE JUMP  P VIBE  R RESET  F5 RELOAD" :
+        "WASD MOVE  MMB UP/DOWN  P VIBE  R RESET  F5 RELOAD  BACKSPACE OVERRIDE";
     hud_emit_text(vertices, &count, x, y, scale, help);
 
     SDL_UnmapGPUTransferBuffer(state->device, state->hud_transfer_buffer);
@@ -889,9 +1176,7 @@ file_mtime_ns(const char *path) {
 static void
 apply_scene(AppState *state, const TerrainScene *scene, bool update_palette) {
     state->terrain_scene = *scene;
-    terrain_scene_apply_to_world(&state->terrain_scene, &state->terrain_world);
-    state->terrain_config = state->terrain_world.base;
-    state->density_version = state->terrain_scene.density_hash;
+    rebuild_effective_terrain(state);
     if (update_palette && !state->palette_override) {
         state->palette_index = terrain_scene_palette_index(&state->terrain_scene);
     }
@@ -909,45 +1194,41 @@ reload_scene(AppState *state, bool force) {
     if (!terrain_scene_load_yaml(state->scene_path, &next, error, sizeof(error))) {
         snprintf(state->reload_status, sizeof(state->reload_status), "ERROR");
         snprintf(state->reload_error, sizeof(state->reload_error), "%s", error);
-        log_error("Scene reload failed: %s", error);
-        state->scene_mtime_ns = mtime;
+        log_error("Scene reload failed path=%s error=%s", state->scene_path, error);
         return false;
     }
 
-    const uint32_t old_density = state->terrain_scene.density_hash;
+    const uint32_t old_density = terrain_density_hash(&state->terrain_world.base);
     const uint32_t old_material = state->terrain_scene.material_hash;
     const uint32_t old_graph = state->terrain_scene.graph_hash;
     apply_scene(state, &next, true);
+    state->scene_fallback_builtin = false;
     state->scene_mtime_ns = mtime;
+    state->last_reload_check_ms = SDL_GetTicks();
+    state->reload_frame = state->frame_count;
+    state->reload_hash = terrain_density_hash(&state->terrain_world.base);
     snprintf(state->reload_status, sizeof(state->reload_status), "OK");
     state->reload_error[0] = '\0';
     state->reload_invalidated_chunks =
-        old_density != 0u && old_density != next.density_hash ? (uint32_t)state->active_count :
+        old_density != 0u && old_density != state->reload_hash ? (uint32_t)state->active_count :
         old_graph != 0u && old_graph != next.graph_hash ? (uint32_t)state->active_count :
         0u;
-    if (old_material != 0u && old_material != next.material_hash && old_density == next.density_hash) {
+    if (old_material != 0u && old_material != next.material_hash && old_density == state->reload_hash) {
         state->reload_invalidated_chunks = 0u;
     }
-    log_info(
-        "Loaded scene '%s' (%s): %u regions, density=%08x material=%08x graph=%08x",
-        state->terrain_scene.id,
-        state->terrain_scene.name,
-        state->terrain_world.region_count,
-        state->terrain_scene.density_hash,
-        state->terrain_scene.material_hash,
-        state->terrain_scene.graph_hash
-    );
+    log_scene_summary(state->scene_path, &state->terrain_scene);
     return true;
 }
 
 static bool
 initialize_terrain(AppState *state) {
-    const char *scene_path = getenv("TERRAGEN_SCENE");
-    snprintf(state->scene_path, sizeof(state->scene_path), "%s", scene_path != NULL ? scene_path : "res/scenes/mountain_valley.yaml");
     snprintf(state->reload_status, sizeof(state->reload_status), "INIT");
     if (!reload_scene(state, true)) {
         TerrainScene fallback = terrain_scene_default();
         apply_scene(state, &fallback, getenv("TERRAGEN_PALETTE") == NULL);
+        state->scene_fallback_builtin = true;
+        snprintf(state->reload_status, sizeof(state->reload_status), "FALLBACK");
+        snprintf(state->reload_error, sizeof(state->reload_error), "SCENE LOAD FAILED - USING BUILTIN DEFAULT");
         log_warn("Using built-in fallback terrain scene");
     }
 
@@ -1058,8 +1339,8 @@ chunk_system_update(AppState *state) {
     const float pov_x = state->camera_position[0];
     const float pov_z = state->camera_position[2];
 
-    /* Content-addressed density version comes from the hot-reloaded scene. */
-    state->density_version = state->terrain_scene.density_hash;
+    /* Content-addressed density version comes from the hot-reloaded scene plus runtime overrides. */
+    state->density_version = terrain_density_hash(&state->terrain_world.base);
 
     state->active_count = chunk_active_set_hyst(
         pov_x, pov_z, CHUNK_REGION_TEST,
@@ -1205,8 +1486,7 @@ chunk_system_update(AppState *state) {
 /* Draw a chunk if it is resident and ready, deduped per frame. Returns true if
  * the chunk's footprint is covered (drawn now or already drawn this frame). */
 static bool
-render_record(AppState *state, SDL_GPURenderPass *render_pass, const ChunkGenKey *key) {
-    ChunkRecord *rec = chunk_cache_find(&state->chunk_cache, key);
+render_chunk_record(AppState *state, SDL_GPURenderPass *render_pass, ChunkRecord *rec, uint32_t *counter) {
     if (rec == NULL || rec->status != CHUNK_STATUS_READY) {
         return false;
     }
@@ -1215,25 +1495,50 @@ render_record(AppState *state, SDL_GPURenderPass *render_pass, const ChunkGenKey
         terrain_gpu_render(render_pass, &state->chunk_pool[rec->slot]);
         rec->rendered_frame = stamp;
         state->dbg_rendered += 1u;
+        if (counter != NULL) {
+            *counter += 1u;
+        }
     }
     return true;
+}
+
+static bool
+render_record(AppState *state, SDL_GPURenderPass *render_pass, const ChunkGenKey *key) {
+    return render_chunk_record(
+        state,
+        render_pass,
+        chunk_cache_find(&state->chunk_cache, key),
+        &state->dbg_exact_rendered
+    );
+}
+
+static bool
+render_stale_record(AppState *state, SDL_GPURenderPass *render_pass, const ChunkGenKey *key, uint32_t *counter) {
+    ChunkRecord *exact = chunk_cache_find(&state->chunk_cache, key);
+    ChunkRecord *rec = chunk_cache_find_ready_geometry(&state->chunk_cache, key);
+    if (rec == NULL || rec == exact) {
+        return false;
+    }
+    return render_chunk_record(state, render_pass, rec, counter);
 }
 
 /* When an active chunk isn't ready yet, cover its footprint with the nearest
  * resident-ready ancestor (the coarser chunk that was there before a refine)
  * or, failing that, any ready children (the finer chunks from before a
  * coarsen). This keeps LOD changes from blanking the area out. */
-static void
+static bool
 render_coverage_fallback(AppState *state, SDL_GPURenderPass *render_pass, ChunkGenKey key) {
     ChunkGenKey a = key;
     while (a.lod + 1u < CHUNK_LOD_COUNT) {
         a.cx /= 2;
         a.cz /= 2;
         a.lod += 1u;
-        if (render_record(state, render_pass, &a)) {
-            return;
+        if (render_stale_record(state, render_pass, &a, &state->dbg_fallback_ancestor_rendered) ||
+            render_record(state, render_pass, &a)) {
+            return true;
         }
     }
+    bool rendered_child = false;
     if (key.lod > 0u) {
         ChunkGenKey ch = key;
         ch.lod = key.lod - 1u;
@@ -1241,15 +1546,24 @@ render_coverage_fallback(AppState *state, SDL_GPURenderPass *render_pass, ChunkG
             for (int32_t dx = 0; dx < 2; dx += 1) {
                 ch.cx = key.cx * 2 + dx;
                 ch.cz = key.cz * 2 + dz;
-                render_record(state, render_pass, &ch);
+                rendered_child =
+                    render_stale_record(state, render_pass, &ch, &state->dbg_fallback_child_rendered) ||
+                    render_record(state, render_pass, &ch) ||
+                    rendered_child;
             }
         }
     }
+    return rendered_child;
 }
 
 static void
 chunk_system_render(AppState *state, SDL_GPURenderPass *render_pass) {
     state->dbg_rendered = 0u;
+    state->dbg_exact_rendered = 0u;
+    state->dbg_stale_rendered = 0u;
+    state->dbg_fallback_ancestor_rendered = 0u;
+    state->dbg_fallback_child_rendered = 0u;
+    state->dbg_blank_chunks = 0u;
     /* Pass 1: every ready active chunk. */
     for (size_t i = 0u; i < state->active_count; i += 1u) {
         render_record(state, render_pass, &state->active_keys[i]);
@@ -1258,7 +1572,12 @@ chunk_system_render(AppState *state, SDL_GPURenderPass *render_pass) {
     for (size_t i = 0u; i < state->active_count; i += 1u) {
         ChunkRecord *rec = chunk_cache_find(&state->chunk_cache, &state->active_keys[i]);
         if (rec == NULL || rec->status != CHUNK_STATUS_READY) {
-            render_coverage_fallback(state, render_pass, state->active_keys[i]);
+            if (render_stale_record(state, render_pass, &state->active_keys[i], &state->dbg_stale_rendered)) {
+                continue;
+            }
+            if (!render_coverage_fallback(state, render_pass, state->active_keys[i])) {
+                state->dbg_blank_chunks += 1u;
+            }
         }
     }
 }
@@ -1483,8 +1802,14 @@ update_camera(AppState *state, float dt) {
 
 SDL_AppResult
 SDL_AppInit(void **appstate, int argc, char *argv[]) {
-    (void)argc;
-    (void)argv;
+    const AppOptions options = parse_options(argc, argv);
+    if (options.show_help) {
+        print_usage();
+        return SDL_APP_SUCCESS;
+    }
+    if (options.sample_check) {
+        return run_sample_check(options.scene_path) == 0 ? SDL_APP_SUCCESS : SDL_APP_FAILURE;
+    }
 
     AppState *state = calloc(1u, sizeof(*state));
     if (state == NULL) {
@@ -1505,6 +1830,9 @@ SDL_AppInit(void **appstate, int argc, char *argv[]) {
         state->palette_index = (uint32_t)SDL_atoi(palette) % palette_count();
         state->palette_override = true;
     }
+    snprintf(state->scene_path, sizeof(state->scene_path), "%s", options.scene_path);
+    state->auto_hot_reload = options.auto_hot_reload;
+    state->reload_interval_ms = options.reload_interval_ms;
     state->camera_mode = CAM_FREE;
     state->fps = 0.0f;
     state->last_frame_ticks = SDL_GetPerformanceCounter();
@@ -1578,7 +1906,13 @@ SDL_AppIterate(void *appstate) {
     dt = clampf(dt, 0.0f, 0.1f);
     const float instant_fps = dt > 0.000001f ? 1.0f / dt : 0.0f;
     state->fps = state->fps <= 0.0f ? instant_fps : state->fps * 0.92f + instant_fps * 0.08f;
-    reload_scene(state, false);
+    if (state->auto_hot_reload) {
+        const uint64_t ticks = SDL_GetTicks();
+        if (ticks - state->last_reload_check_ms >= state->reload_interval_ms) {
+            state->last_reload_check_ms = ticks;
+            reload_scene(state, false);
+        }
+    }
     update_camera(state, dt);
     chunk_system_update(state);
 
@@ -1710,8 +2044,20 @@ SDL_AppEvent(void *appstate, SDL_Event *event) {
                     state->velocity_y = CAM_JUMP_SPEED;
                 }
                 break;
+            case SDLK_BACKSPACE:
+                state->terrain_overrides = (RuntimeTerrainOverrides){0};
+                rebuild_effective_terrain(state);
+                log_info("Terrain overrides cleared");
+                break;
+            case SDLK_F5:
+                (void)reload_scene(state, true);
+                break;
             case SDLK_R:
-                if (reload_scene(state, true)) {
+                if ((event->key.mod & SDL_KMOD_CTRL) != 0u) {
+                    state->terrain_overrides = (RuntimeTerrainOverrides){0};
+                    rebuild_effective_terrain(state);
+                    log_info("Terrain overrides cleared");
+                } else {
                     reset_camera(state);
                 }
                 break;
@@ -1723,14 +2069,136 @@ SDL_AppEvent(void *appstate, SDL_Event *event) {
                 log_info("Palette: %s", palette_get(state->palette_index)->name);
                 break;
             case SDLK_J:
+                set_override_float(
+                    state,
+                    TERRAIN_OVERRIDE_MAX_HEIGHT,
+                    clampf(state->terrain_config.max_height - 2.0f, state->terrain_config.min_height + 2.0f, 256.0f),
+                    &state->terrain_overrides.values.max_height
+                );
+                break;
             case SDLK_K:
+                set_override_float(
+                    state,
+                    TERRAIN_OVERRIDE_MAX_HEIGHT,
+                    clampf(state->terrain_config.max_height + 2.0f, state->terrain_config.min_height + 2.0f, 256.0f),
+                    &state->terrain_overrides.values.max_height
+                );
+                break;
+            case SDLK_H:
+                set_override_float(
+                    state,
+                    TERRAIN_OVERRIDE_MIN_HEIGHT,
+                    clampf(state->terrain_config.min_height - 2.0f, -256.0f, state->terrain_config.max_height - 2.0f),
+                    &state->terrain_overrides.values.min_height
+                );
+                break;
+            case SDLK_Y:
+                set_override_float(
+                    state,
+                    TERRAIN_OVERRIDE_MIN_HEIGHT,
+                    clampf(state->terrain_config.min_height + 2.0f, -256.0f, state->terrain_config.max_height - 2.0f),
+                    &state->terrain_overrides.values.min_height
+                );
+                break;
+            case SDLK_B:
+                set_override_float(
+                    state,
+                    TERRAIN_OVERRIDE_BASE_HEIGHT,
+                    clampf(state->terrain_config.base_height - 1.0f, -256.0f, 256.0f),
+                    &state->terrain_overrides.values.base_height
+                );
+                break;
+            case SDLK_V:
+                set_override_float(
+                    state,
+                    TERRAIN_OVERRIDE_BASE_HEIGHT,
+                    clampf(state->terrain_config.base_height + 1.0f, -256.0f, 256.0f),
+                    &state->terrain_overrides.values.base_height
+                );
+                break;
             case SDLK_U:
+                set_override_float(
+                    state,
+                    TERRAIN_OVERRIDE_WARP_AMOUNT,
+                    clampf(state->terrain_config.warp_amount - 1.0f, 0.0f, 48.0f),
+                    &state->terrain_overrides.values.warp_amount
+                );
+                break;
             case SDLK_I:
+                set_override_float(
+                    state,
+                    TERRAIN_OVERRIDE_WARP_AMOUNT,
+                    clampf(state->terrain_config.warp_amount + 1.0f, 0.0f, 48.0f),
+                    &state->terrain_overrides.values.warp_amount
+                );
+                break;
+            case SDLK_9:
+                set_override_float(
+                    state,
+                    TERRAIN_OVERRIDE_WARP_FREQUENCY,
+                    clampf(state->terrain_config.warp_frequency * 0.85f, 0.001f, 0.500f),
+                    &state->terrain_overrides.values.warp_frequency
+                );
+                break;
+            case SDLK_0:
+                set_override_float(
+                    state,
+                    TERRAIN_OVERRIDE_WARP_FREQUENCY,
+                    clampf(state->terrain_config.warp_frequency * 1.18f, 0.001f, 0.500f),
+                    &state->terrain_overrides.values.warp_frequency
+                );
+                break;
             case SDLK_N:
+                set_override_float(
+                    state,
+                    TERRAIN_OVERRIDE_NOISE_FREQUENCY,
+                    clampf(state->terrain_config.noise_frequency * 0.85f, 0.001f, 0.500f),
+                    &state->terrain_overrides.values.noise_frequency
+                );
+                break;
             case SDLK_M:
+                set_override_float(
+                    state,
+                    TERRAIN_OVERRIDE_NOISE_FREQUENCY,
+                    clampf(state->terrain_config.noise_frequency * 1.18f, 0.001f, 0.500f),
+                    &state->terrain_overrides.values.noise_frequency
+                );
+                break;
+            case SDLK_COMMA:
+                set_override_float(
+                    state,
+                    TERRAIN_OVERRIDE_NOISE_AMPLITUDE,
+                    clampf(state->terrain_config.noise_amplitude - 1.0f, 0.0f, 256.0f),
+                    &state->terrain_overrides.values.noise_amplitude
+                );
+                break;
+            case SDLK_PERIOD:
+                set_override_float(
+                    state,
+                    TERRAIN_OVERRIDE_NOISE_AMPLITUDE,
+                    clampf(state->terrain_config.noise_amplitude + 1.0f, 0.0f, 256.0f),
+                    &state->terrain_overrides.values.noise_amplitude
+                );
+                break;
             case SDLK_LEFTBRACKET:
+                if (state->terrain_config.noise_octaves > 1u) {
+                    set_override_u32(
+                        state,
+                        TERRAIN_OVERRIDE_NOISE_OCTAVES,
+                        state->terrain_config.noise_octaves - 1u,
+                        &state->terrain_overrides.values.noise_octaves
+                    );
+                }
+                break;
             case SDLK_RIGHTBRACKET:
-                log_info("Terrain shaping hotkeys are disabled; edit %s", state->scene_path);
+                if (state->terrain_config.noise_octaves < 8u) {
+                    set_override_u32(
+                        state,
+                        TERRAIN_OVERRIDE_NOISE_OCTAVES,
+                        state->terrain_config.noise_octaves + 1u,
+                        &state->terrain_overrides.values.noise_octaves
+                    );
+                }
                 break;
             default:
                 break;

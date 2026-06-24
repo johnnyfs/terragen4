@@ -582,6 +582,8 @@ terrain_scene_load_yaml(const char *path, TerrainScene *out_scene, char *error, 
     TerrainRegionNode *region = NULL;
     TerrainRegionInfluence *influence = NULL;
     TerrainNoiseOctave *octave = NULL;
+    bool explicit_base_height = false;
+    bool explicit_legacy_amplitude = false;
     char line_storage[512];
     while (fgets(line_storage, sizeof(line_storage), f) != NULL) {
         strip_comment(line_storage);
@@ -633,7 +635,10 @@ terrain_scene_load_yaml(const char *path, TerrainScene *out_scene, char *error, 
             const char *v = value_after_colon(line);
             if (strncmp(line, "min:", 4) == 0) { parse_float_value(v, &scene.world_data.base.min_height); }
             else if (strncmp(line, "max:", 4) == 0) { parse_float_value(v, &scene.world_data.base.max_height); }
-            else if (strncmp(line, "base:", 5) == 0) { parse_float_value(v, &scene.world_data.base.base_height); }
+            else if (strncmp(line, "base:", 5) == 0) {
+                parse_float_value(v, &scene.world_data.base.base_height);
+                explicit_base_height = true;
+            }
             continue;
         }
         if (section == SECTION_NOISE || section == SECTION_LEGACY_NOISE || section == SECTION_OCTAVES) {
@@ -656,7 +661,10 @@ terrain_scene_load_yaml(const char *path, TerrainScene *out_scene, char *error, 
             if (strncmp(line, "gain:", 5) == 0) { parse_float_value(v, &scene.world_data.base.noise_gain); continue; }
             if (section == SECTION_LEGACY_NOISE) {
                 if (strncmp(line, "frequency:", 10) == 0) { parse_float_value(v, &scene.world_data.base.noise_frequency); }
-                else if (strncmp(line, "amplitude:", 10) == 0) { parse_float_value(v, &scene.world_data.base.noise_amplitude); }
+                else if (strncmp(line, "amplitude:", 10) == 0) {
+                    parse_float_value(v, &scene.world_data.base.noise_amplitude);
+                    explicit_legacy_amplitude = true;
+                }
                 else if (strncmp(line, "octaves:", 8) == 0) { parse_u32_value(v, &scene.world_data.base.noise_octaves); }
                 else if (strncmp(line, "lacunarity:", 11) == 0) { parse_float_value(v, &scene.world_data.base.noise_lacunarity); }
                 else if (strncmp(line, "gain:", 5) == 0) { parse_float_value(v, &scene.world_data.base.noise_gain); }
@@ -779,6 +787,18 @@ terrain_scene_load_yaml(const char *path, TerrainScene *out_scene, char *error, 
         }
     }
     fclose(f);
+
+    if (scene.world_data.base.basis_count == 0u && (!explicit_base_height || !explicit_legacy_amplitude)) {
+        const float base_height = scene.world_data.base.base_height;
+        const float noise_amplitude = scene.world_data.base.noise_amplitude;
+        terrain_region_apply_height_range(&scene.world_data.base);
+        if (explicit_base_height) {
+            scene.world_data.base.base_height = base_height;
+        }
+        if (explicit_legacy_amplitude) {
+            scene.world_data.base.noise_amplitude = noise_amplitude;
+        }
+    }
 
     scene.height = (TerrainSceneHeight) {
         .min_height = scene.world_data.base.min_height,
