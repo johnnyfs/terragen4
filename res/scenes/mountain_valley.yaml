@@ -20,7 +20,7 @@ scene:
     octaves:
       - name: macro
         kind: fbm
-        frequency: 0.015
+        frequency: 0.215
         amplitude: 48.0
       - name: forms
         kind: fbm

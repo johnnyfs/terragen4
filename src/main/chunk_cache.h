@@ -53,6 +53,7 @@ typedef struct ChunkCache {
 
 bool chunk_cache_init(ChunkCache *cache, size_t max_resident);
 void chunk_cache_destroy(ChunkCache *cache);
+void chunk_cache_clear(ChunkCache *cache);
 
 /* Lookup; returns the live record or NULL. */
 ChunkRecord *chunk_cache_find(ChunkCache *cache, const ChunkGenKey *key);
