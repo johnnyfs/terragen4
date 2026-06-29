@@ -778,6 +778,10 @@ terrain_field_surface_height_sample(const TerrainFieldPacket *packet, float x, f
     terrain_fields_init(&fields);
     float masks[TERRAIN_MAX_ACTIVE_REGIONS] = {0};
     float grade_y[TERRAIN_MAX_ACTIVE_REGIONS] = {0};
+    /* Heightfield convention: the surface is f(x,z) only. All octave/warp/
+     * region/feature HEIGHT math uses y = 0 so the surface never depends on the
+     * sampled height. True 3D cuts use the full (x,y,z) (see _density_sample).
+     * This must match sample_sdf in res/shaders/terrain_field.glsl. */
     const float y = 0.0f;
     for (uint32_t i = 0u; i < packet->region_count && i < TERRAIN_MAX_ACTIVE_REGIONS; i += 1u) {
         const TerrainRegionNode *region = &packet->regions[i];
@@ -806,8 +810,29 @@ terrain_field_surface_height_sample(const TerrainFieldPacket *packet, float x, f
     return surface;
 }
 
+/* Count regions whose XZ footprint contains (x,z) and whose mask survives the
+ * cutoff at this point. Mirrors the cull/mask test in surface_height_sample. */
+uint32_t
+terrain_field_packet_active_region_count(const TerrainFieldPacket *packet, float x, float z) {
+    uint32_t active = 0u;
+    for (uint32_t i = 0u; i < packet->region_count && i < TERRAIN_MAX_ACTIVE_REGIONS; i += 1u) {
+        const TerrainRegionNode *region = &packet->regions[i];
+        if (!terrain_aabb_contains_xz(&region->effect_bbox, x, z)) {
+            continue;
+        }
+        float grade_y = 0.0f;
+        if (terrain_region_mask(region, x, 0.0f, z, &grade_y) > region->cutoff_epsilon) {
+            active += 1u;
+        }
+    }
+    return active;
+}
+
 float
 terrain_field_density_sample(const TerrainFieldPacket *packet, float x, float y, float z) {
+    /* Heightfield terrain: surface = f(x,z), sdf = y - surface. Only the true
+     * 3D cuts below (caves, box cut/solid, cylinder) use the full (x,y,z). This
+     * must match sample_sdf in res/shaders/terrain_field.glsl. */
     const float surface = terrain_field_surface_height_sample(packet, x, z);
 
     float sdf = y - surface;

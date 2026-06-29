@@ -207,6 +207,7 @@ float terrain_height_sample(const TerrainRegionConfig *config, float x, float z)
 float terrain_density_sample(const TerrainRegionConfig *config, float x, float y, float z);
 float terrain_field_surface_height_sample(const TerrainFieldPacket *packet, float x, float z);
 float terrain_field_density_sample(const TerrainFieldPacket *packet, float x, float y, float z);
+uint32_t terrain_field_packet_active_region_count(const TerrainFieldPacket *packet, float x, float z);
 
 TerrainFieldPacket terrain_field_packet_from_config(const TerrainRegionConfig *config);
 

@@ -1,0 +1,169 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "terragen/scene.schema.json",
+  "title": "Terragen Scene",
+  "description": "Structure of res/scenes/*.yaml. Enum values are grounded in the engine's parser (src/main/terrain_scene.c) so that edited YAML round-trips and hot-reloads correctly.",
+  "type": "object",
+  "required": ["version", "scene"],
+  "properties": {
+    "version": { "type": "integer" },
+    "scene": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "world": {
+          "type": "object",
+          "properties": {
+            "region_size_chunks": { "type": "integer", "minimum": 1 },
+            "base_cell_size": { "type": "number", "exclusiveMinimum": 0 },
+            "chunk_cells": { "type": "integer", "minimum": 1 },
+            "lod_count": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "height": {
+          "type": "object",
+          "properties": {
+            "min": { "type": "number" },
+            "max": { "type": "number" },
+            "base": { "type": "number" }
+          }
+        },
+        "noise": {
+          "type": "object",
+          "properties": {
+            "seed": { "type": "integer" },
+            "legacy": {
+              "type": "object",
+              "description": "Legacy single-band fBm noise. legacy_default.yaml must keep this and NOT define named octaves.",
+              "properties": {
+                "frequency": { "type": "number" },
+                "amplitude": { "type": "number" },
+                "octaves": { "type": "integer", "minimum": 1 },
+                "lacunarity": { "type": "number" },
+                "gain": { "type": "number" }
+              }
+            },
+            "octaves": {
+              "type": "array",
+              "description": "Named noise octaves. Influences of field octave_amplitude reference these by name.",
+              "items": {
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                  "name": { "type": "string" },
+                  "kind": { "type": "string", "enum": ["fbm", "ridged"] },
+                  "frequency": { "type": "number" },
+                  "amplitude": { "type": "number" },
+                  "sharpness": { "type": "number" }
+                }
+              }
+            },
+            "lacunarity": { "type": "number" },
+            "gain": { "type": "number" }
+          }
+        },
+        "warp": {
+          "type": "object",
+          "properties": {
+            "frequency": { "type": "number" },
+            "amplitude": { "type": "number" }
+          }
+        },
+        "material": {
+          "type": "object",
+          "properties": {
+            "default_vibe": { "type": "string" },
+            "default_flat_material": { "type": "string" },
+            "default_slope_material": { "type": "string" }
+          }
+        }
+      }
+    },
+    "regions": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/region" }
+    }
+  },
+  "definitions": {
+    "vec3": {
+      "type": "array",
+      "items": { "type": "number" },
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "region": {
+      "type": "object",
+      "required": ["id"],
+      "properties": {
+        "id": { "type": "string" },
+        "parent": { "type": "string" },
+        "kind": {
+          "type": "string",
+          "description": "Free-form label. Common: mountain, valley, plateau, path, riverbed, peak, cave.",
+          "examples": ["mountain", "valley", "plateau", "path", "riverbed", "peak", "cave"]
+        },
+        "allow_outside_parent": { "type": "boolean" },
+        "priority": { "type": "integer" },
+        "geometry": { "$ref": "#/definitions/geometry" },
+        "transition": { "$ref": "#/definitions/transition" },
+        "influences": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/influence" }
+        }
+      }
+    },
+    "geometry": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "description": "Engine-supported geometry. 'plane'/'ramp' are aliases; 'capsule'/'capsule_line' alias 'capsule_path'.",
+          "enum": ["box", "oriented_box", "sphere", "ellipsoid", "capsule_path", "capsule", "capsule_line", "plane", "ramp"]
+        },
+        "center": { "$ref": "#/definitions/vec3" },
+        "size": { "$ref": "#/definitions/vec3" },
+        "rotation_y": { "type": "number" },
+        "radius": { "type": "number", "exclusiveMinimum": 0 },
+        "mask_warp": { "type": "number" },
+        "edge_noise": { "type": "number", "description": "Alias of mask_warp; normalized to mask_warp on save." },
+        "points": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/vec3" }
+        }
+      }
+    },
+    "transition": {
+      "type": "object",
+      "description": "NOTE: the engine currently uses only falloff and cutoff_epsilon; 'type' is preserved for readability/forward-compat but is treated as smoothstep at runtime.",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["step", "linear", "smoothstep", "smootherstep"]
+        },
+        "falloff": { "type": "number", "minimum": 0 },
+        "cutoff_epsilon": { "type": "number", "minimum": 0 }
+      }
+    },
+    "influence": {
+      "type": "object",
+      "required": ["field", "mode"],
+      "properties": {
+        "field": {
+          "type": "string",
+          "description": "Engine field names. Friendly names map: warp_amount->warp_amount_scale, ridge_amount->ridge_amount_scale, carve->carve_amount, material->material_id.",
+          "enum": ["height", "octave_amplitude", "warp_amount_scale", "ridge_amount_scale", "carve_amount", "material_id", "vibe"]
+        },
+        "mode": {
+          "type": "string",
+          "enum": ["add", "multiply", "pull_to_target", "pull", "pull_to_path_grade", "subtract", "carve", "override"]
+        },
+        "octave": { "type": "string", "description": "Required when field == octave_amplitude; must match a scene.noise.octaves[].name." },
+        "value": { "type": "number" },
+        "target": { "type": "number" },
+        "strength": { "type": "number" }
+      }
+    }
+  }
+}

@@ -409,10 +409,12 @@ run_sample_check(const char *path) {
         (void)terrain_world_build_packet(&scene.world_data, CHUNK_REGION_TEST, x, z, x, z, &packet);
         const float surface = terrain_field_surface_height_sample(&packet, x, z);
         const float density = terrain_field_density_sample(&packet, x, surface, z);
+        const uint32_t active_regions = terrain_field_packet_active_region_count(&packet, x, z);
+        const TerrainHeightBounds bounds = terrain_field_packet_snap_height_bounds(&packet);
         const ChunkCoord coord = chunk_from_world(0u, x, z);
         const ChunkLayout layout = sparse_grid_chunk_layout_packet(&packet, coord.lod, coord.cx, coord.cz);
         printf(
-            "sample x=%.1f z=%.1f surface=%.3f density=%.6f chunk=%d,%d,lod%u local_min_y=%d array_dim_y=%d cells=%d packet_basis=%u packet_regions=%u packet_features=%u\n",
+            "sample x=%.1f z=%.1f surface=%.3f density=%.6f chunk=%d,%d,lod%u local_min_y=%d array_dim_y=%d cells=%d packet_basis=%u packet_regions=%u active_regions=%u packet_features=%u bounds_y=%d..%d\n",
             x,
             z,
             surface,
@@ -425,7 +427,10 @@ run_sample_check(const char *path) {
             layout.array_dim_x * layout.array_dim_y * layout.array_dim_z,
             packet.base.basis_count,
             packet.region_count,
-            packet.feature_count
+            active_regions,
+            packet.feature_count,
+            bounds.min_y,
+            bounds.max_y
         );
     }
     return 0;
@@ -913,6 +918,8 @@ hud_emit_text(HudVertex *vertices, uint32_t *count, float x, float y, float scal
     }
 }
 
+static float find_ground_y(const TerrainWorld *world, float x, float z);
+
 static bool
 build_and_upload_hud(AppState *state, SDL_GPUCommandBuffer *command_buffer) {
     HudVertex *vertices = SDL_MapGPUTransferBuffer(state->device, state->hud_transfer_buffer, true);
@@ -1036,6 +1043,24 @@ build_and_upload_hud(AppState *state, SDL_GPUCommandBuffer *command_buffer) {
     );
     hud_emit_text(vertices, &count, x, y, scale, line);
     y += line_step;
+
+    if (state->camera_mode == CAM_GROUND) {
+        const float floor_y = find_ground_y(
+            &state->terrain_world,
+            state->camera_position[0],
+            state->camera_position[2]
+        ) + CAM_EYE_HEIGHT;
+        SDL_snprintf(
+            line,
+            sizeof(line),
+            "GROUND %.2f %.2f %.2f",
+            state->camera_position[1],
+            floor_y,
+            (float)CAM_EYE_HEIGHT
+        );
+        hud_emit_text(vertices, &count, x, y, scale, line);
+        y += line_step;
+    }
 
     SDL_snprintf(line, sizeof(line), "WHEEL ZOOM %.1f DEG", state->camera_fov_degrees);
     hud_emit_text(vertices, &count, x, y, scale, line);
@@ -1163,7 +1188,7 @@ file_mtime_ns(const char *path) {
         return 0u;
     }
 #if defined(__APPLE__)
-    return (uint64_t)st.st_mtimespec.tv_sec * 1000000000ull + (uint64_t)st.st_mtimespec.tv_nsec;
+    return (uint64_t)st.st_mtime * 1000000000ull + (uint64_t)st.st_mtimensec;
 #elif defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__)
     return (uint64_t)st.st_mtimespec.tv_sec * 1000000000ull + (uint64_t)st.st_mtimespec.tv_nsec;
 #elif defined(__linux__)

@@ -317,6 +317,13 @@ float apply_region_post(uint r, float mask, float grade_y, float surface) {
 }
 
 float sample_sdf(vec3 p) {
+    // Heightfield convention: terrain surface is f(x,z) only. All octave/warp/
+    // region/feature HEIGHT math must use hp (y forced to 0) so the surface does
+    // not depend on the sampled p.y. Keep full p only for true 3D SDF ops
+    // (caves, box cut/solid, cylinder, future mesh SDFs). Must match the CPU
+    // convention in terrain_field_surface_height_sample / _density_sample.
+    vec3 hp = vec3(p.x, 0.0, p.z);
+
     float octave_scale[8];
     for (int i = 0; i < 8; i += 1) {
         octave_scale[i] = 1.0;
@@ -331,11 +338,11 @@ float sample_sdf(vec3 p) {
     float warp_scale = 1.0;
     uint region_count = uint(clamp(params.omin.w, 0, 16));
     for (uint i = 0u; i < region_count; i += 1u) {
-        if (!aabb_contains_xz(i, p)) {
+        if (!aabb_contains_xz(i, hp)) {
             continue;
         }
         float grade_y = 0.0;
-        float m = region_mask(i, p, grade_y);
+        float m = region_mask(i, hp, grade_y);
         if (m <= params.region_data2[i].y) {
             continue;
         }
@@ -344,7 +351,7 @@ float sample_sdf(vec3 p) {
         apply_region_pre(i, m, height_offset, octave_scale, warp_scale);
     }
 
-    float surface = params.noise.w + base_displacement_scaled(p, octave_scale, warp_scale) + height_offset;
+    float surface = params.noise.w + base_displacement_scaled(hp, octave_scale, warp_scale) + height_offset;
     for (uint i = 0u; i < region_count; i += 1u) {
         if (masks[i] > 0.0) {
             surface = apply_region_post(i, masks[i], grades[i], surface);
@@ -352,7 +359,7 @@ float sample_sdf(vec3 p) {
     }
     uint feature_count = uint(params.lmin.w);
     for (uint i = 0u; i < feature_count; i += 1u) {
-        surface += feature_height_delta(i, p, surface);
+        surface += feature_height_delta(i, hp, surface);
     }
 
     float sdf = p.y - surface;

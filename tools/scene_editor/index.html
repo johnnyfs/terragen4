@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Terragen Scene Editor</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header id="topbar">
+    <span class="brand">terragen scene editor</span>
+    <span id="scene-name" class="muted"></span>
+    <span id="dirty-badge" class="badge hidden">unsaved changes</span>
+    <span id="valid-badge" class="badge"></span>
+    <span class="spacer"></span>
+    <span id="saved-at" class="muted"></span>
+    <button id="btn-revert" disabled>Revert</button>
+    <button id="btn-save" disabled>Save <kbd>⌘S</kbd></button>
+  </header>
+
+  <main id="layout">
+    <section id="left" class="pane">
+      <div class="pane-head">Scene</div>
+      <select id="scene-picker"></select>
+
+      <div class="pane-head row">
+        <span>Regions</span>
+        <span class="actions">
+          <button id="btn-add-root" title="Add a root region">+ root</button>
+        </span>
+      </div>
+      <div id="region-tree" class="tree"></div>
+
+      <div class="pane-head">Templates</div>
+      <div id="templates" class="templates"></div>
+    </section>
+
+    <section id="middle" class="pane">
+      <div id="editor"></div>
+    </section>
+
+    <section id="right" class="pane">
+      <div class="pane-head">Validation</div>
+      <div id="validation"></div>
+      <div class="pane-head row">
+        <span>YAML preview</span>
+        <span class="actions"><button id="btn-copy">copy</button></span>
+      </div>
+      <pre id="yaml-preview" class="yaml"></pre>
+    </section>
+  </main>
+
+  <div id="toast" class="toast hidden"></div>
+  <script src="app.js"></script>
+</body>
+</html>

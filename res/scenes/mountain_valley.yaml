@@ -1,20 +1,16 @@
 version: 1
-
 scene:
   id: test_mountain_valley
   name: "Mountain Valley Test"
-
   world:
     region_size_chunks: 24
     base_cell_size: 1.0
     chunk_cells: 24
     lod_count: 3
-
   height:
     min: -8.0
-    max: 18.0
+    max: 100.0
     base: 5.0
-
   noise:
     seed: 1337
     legacy:
@@ -24,174 +20,167 @@ scene:
       lacunarity: 2.05
       gain: 0.48
     octaves:
-      - name: macro
-        kind: fbm
-        frequency: 0.032
-        amplitude: 16.0
-      - name: forms
-        kind: fbm
-        frequency: 0.085
-        amplitude: 8.0
-      - name: detail
-        kind: fbm
-        frequency: 0.14
-        amplitude: 3.0
-      - name: ridges
-        kind: ridged
-        frequency: 0.075
-        amplitude: 6.0
-        sharpness: 1.15
+    - name: macro
+      kind: fbm
+      frequency: 0.032
+      amplitude: 16.0
+    - name: forms
+      kind: fbm
+      frequency: 0.085
+      amplitude: 8.0
+    - name: detail
+      kind: fbm
+      frequency: 0.14
+      amplitude: 3.0
+    - name: ridges
+      kind: ridged
+      frequency: 0.075
+      amplitude: 6.0
+      sharpness: 1.15
     lacunarity: 2.05
     gain: 0.48
-
   warp:
-    frequency: 0.055
+    frequency: 0.5
     amplitude: 6.0
-
   material:
     default_vibe: Meadow
     default_flat_material: grass
     default_slope_material: stone
-
 regions:
-  - id: mountain_area
-    kind: mountain
-    geometry:
-      type: box
-      center: [288, 5, 288]
-      size: [760, 320, 760]
-      edge_noise: 0.0
-    transition:
-      type: smoothstep
-      falloff: 120
-      cutoff_epsilon: 0.01
-    priority: 10
-    influences:
-      - field: height
-        mode: add
-        value: 22
-      - field: octave_amplitude
-        octave: ridges
-        mode: multiply
-        value: 1.45
-      - field: octave_amplitude
-        octave: detail
-        mode: multiply
-        value: 1.20
-
-  - id: valley_floor
-    parent: mountain_area
-    kind: valley
-    geometry:
-      type: capsule_path
-      points:
-        - [68, 5, 408]
-        - [188, 5, 326]
-        - [328, 4, 264]
-        - [508, 3, 148]
-      radius: 140
-      mask_warp: 0.0
-    transition:
-      type: smoothstep
-      falloff: 90
-      cutoff_epsilon: 0.01
-    priority: 40
-    influences:
-      - field: height
-        mode: pull_to_target
-        target: 3
-        strength: 0.86
-      - field: octave_amplitude
-        octave: ridges
-        mode: multiply
-        value: 0.22
-      - field: octave_amplitude
-        octave: detail
-        mode: multiply
-        value: 0.35
-
-  - id: plateau_lookout
-    parent: valley_floor
-    kind: plateau
-    allow_outside_parent: true
-    geometry:
-      type: oriented_box
-      center: [356, 12, 252]
-      size: [170, 18, 132]
-      rotation_y: -14
-    transition:
-      type: smoothstep
-      falloff: 45
-      cutoff_epsilon: 0.01
-    priority: 60
-    influences:
-      - field: height
-        mode: pull_to_target
-        target: 24
-        strength: 0.94
-      - field: octave_amplitude
-        octave: detail
-        mode: multiply
-        value: 0.12
-      - field: octave_amplitude
-        octave: ridges
-        mode: multiply
-        value: 0.18
-
-  - id: path_plateau_to_valley
-    parent: valley_floor
-    kind: path
-    allow_outside_parent: true
-    geometry:
-      type: capsule_path
-      points:
-        - [356, 24, 252]
-        - [320, 16, 288]
-        - [266, 8, 320]
-        - [202, 5, 338]
-      radius: 20
-      mask_warp: 0.0
-    transition:
-      type: smoothstep
-      falloff: 32
-      cutoff_epsilon: 0.01
-    priority: 80
-    influences:
-      - field: height
-        mode: pull_to_path_grade
-        strength: 0.90
-      - field: octave_amplitude
-        octave: detail
-        mode: multiply
-        value: 0.08
-      - field: octave_amplitude
-        octave: ridges
-        mode: multiply
-        value: 0.06
-
-  - id: dry_riverbed
-    parent: valley_floor
-    kind: riverbed
-    allow_outside_parent: true
-    geometry:
-      type: capsule_path
-      points:
-        - [116, 5, 392]
-        - [218, 4, 310]
-        - [338, 3, 238]
-        - [476, 2, 132]
-      radius: 28
-      mask_warp: 0.0
-    transition:
-      type: smoothstep
-      falloff: 38
-      cutoff_epsilon: 0.01
-    priority: 90
-    influences:
-      - field: height
-        mode: add
-        value: -8
-      - field: octave_amplitude
-        octave: detail
-        mode: multiply
-        value: 0.18
+- id: mountain_area
+  kind: mountain
+  priority: 10
+  geometry:
+    type: box
+    center: [288, 5, 288]
+    size: [760, 320, 760]
+    edge_noise: 0.0
+  transition:
+    type: smoothstep
+    falloff: 120
+    cutoff_epsilon: 0.01
+  influences:
+  - field: height
+    mode: add
+    value: 22
+  - field: octave_amplitude
+    octave: ridges
+    mode: multiply
+    value: 1.45
+  - field: octave_amplitude
+    octave: detail
+    mode: multiply
+    value: 1.2
+- id: valley_floor
+  parent: mountain_area
+  kind: valley
+  priority: 40
+  geometry:
+    type: capsule_path
+    radius: 140
+    mask_warp: 0.0
+    points:
+    - [68, 5, 408]
+    - [188, 5, 326]
+    - [328, 4, 264]
+    - [508, 3, 148]
+  transition:
+    type: smoothstep
+    falloff: 90
+    cutoff_epsilon: 0.01
+  influences:
+  - field: height
+    mode: pull_to_target
+    target: 3
+    strength: 0.86
+  - field: octave_amplitude
+    octave: ridges
+    mode: multiply
+    value: 0.22
+  - field: octave_amplitude
+    octave: detail
+    mode: multiply
+    value: 0.35
+- id: plateau_lookout
+  parent: valley_floor
+  kind: plateau
+  allow_outside_parent: true
+  priority: 60
+  geometry:
+    type: oriented_box
+    center: [356, 12, 252]
+    size: [20, 18, 64]
+    rotation_y: -14
+  transition:
+    type: smoothstep
+    falloff: 45
+    cutoff_epsilon: 0.01
+  influences:
+  - field: height
+    mode: pull_to_target
+    target: 24
+    strength: 0.94
+  - field: octave_amplitude
+    octave: detail
+    mode: multiply
+    value: 0.12
+  - field: octave_amplitude
+    octave: ridges
+    mode: multiply
+    value: 0.18
+- id: path_plateau_to_valley
+  parent: valley_floor
+  kind: path
+  allow_outside_parent: true
+  priority: 80
+  geometry:
+    type: capsule_path
+    radius: 20
+    mask_warp: 0.0
+    points:
+    - [356, 24, 252]
+    - [320, 16, 288]
+    - [266, 8, 320]
+    - [202, 5, 338]
+  transition:
+    type: smoothstep
+    falloff: 32
+    cutoff_epsilon: 0.01
+  influences:
+  - field: height
+    mode: pull_to_path_grade
+    strength: 0.9
+  - field: octave_amplitude
+    octave: detail
+    mode: multiply
+    value: 0.08
+  - field: octave_amplitude
+    octave: ridges
+    mode: multiply
+    value: 0.06
+- id: dry_riverbed
+  parent: valley_floor
+  kind: riverbed
+  allow_outside_parent: true
+  priority: 90
+  geometry:
+    type: capsule_path
+    radius: 28
+    mask_warp: 0.0
+    points:
+    - [116, 5, 392]
+    - [218, 4, 310]
+    - [338, 3, 238]
+    - [476, 2, 132]
+  transition:
+    type: smoothstep
+    falloff: 38
+    cutoff_epsilon: 0.01
+  influences:
+  - field: height
+    mode: add
+    value: -8
+  - field: octave_amplitude
+    octave: detail
+    mode: multiply
+    value: 0.18
