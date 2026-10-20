@@ -19,6 +19,7 @@
 #include "sparse_grid.h"
 #include "terrain_config.h"
 #include "terrain_gpu.h"
+#include "terrain_planet.h"
 #include "terrain_scene.h"
 
 #define SDL_MAIN_USE_CALLBACKS
@@ -73,12 +74,16 @@ typedef enum {
 #define CAM_FLIGHT_ACCEL 60.0f   /* FLIGHT: throttle accel from W/S */
 #define CAM_FLIGHT_SPEED_MIN -30.0f
 #define CAM_FLIGHT_SPEED_MAX 140.0f
+#define CAM_PLANET_FLIGHT_ACCEL 2500.0f
+#define CAM_PLANET_FLIGHT_SPEED_MIN -3000.0f
+#define CAM_PLANET_FLIGHT_SPEED_MAX 12000.0f
 #define CAM_FLIGHT_TURN 1.6f     /* FLIGHT: A/D yaw turn rate */
 #define CAM_FLIGHT_PITCH 1.4f    /* FLIGHT: up/down pitch rate */
 #define CAM_FLIGHT_ROLL 2.0f     /* FLIGHT: left/right bank rate */
 #define CAM_FLIGHT_ROLL_MAX 1.2f
 #define CAM_NEAR_Z 0.25f
-#define CAM_FAR_Z 4096.0f
+#define CAM_FLAT_FAR_Z 4096.0f
+#define CAM_PLANET_FAR_Z 300000.0f
 #define TERRAGEN_DEFAULT_SCENE "res/scenes/legacy_default.yaml"
 
 typedef enum TerrainOverrideMask {
@@ -123,6 +128,10 @@ typedef struct AppState {
     SDL_GPUBuffer *hud_vertex_buffer;
     SDL_GPUTransferBuffer *hud_transfer_buffer;
     uint32_t hud_vertex_count;
+    SDL_GPUBuffer *planet_vertex_buffer;
+    SDL_GPUTransferBuffer *planet_transfer_buffer;
+    uint32_t planet_vertex_count;
+    uint32_t planet_patch_count;
 
     TerrainRegionConfig terrain_config;
     TerrainRegionConfig loaded_terrain_config;
@@ -175,6 +184,8 @@ typedef struct AppState {
     uint32_t dbg_fallback_ancestor_rendered;
     uint32_t dbg_fallback_child_rendered;
     uint32_t dbg_blank_chunks;
+    uint32_t dbg_planet_vertices;
+    uint32_t dbg_planet_patches;
 
     uint32_t frame_count;
     uint32_t smoke_frame_limit;
@@ -344,6 +355,27 @@ log_scene_summary(const char *path, const TerrainScene *scene) {
             config->basis[i].sharpness
         );
     }
+    if (scene->planet.enabled) {
+        log_info(
+            "  planet radius=%.1f max_height=%.1f layers=%u planet_hash=%08x",
+            scene->planet.radius,
+            scene->planet.max_height,
+            scene->planet.layer_count,
+            terrain_planet_hash(&scene->planet)
+        );
+        for (uint32_t i = 0u; i < scene->planet.layer_count && i < TERRAIN_MAX_PLANET_LAYERS; i += 1u) {
+            const TerrainPlanetLayer *layer = &scene->planet.layers[i];
+            log_info(
+                "    layer %u name=%s wavelength=%.2f amplitude=%.2f warp=%.2f/%.2f",
+                i,
+                layer->name,
+                layer->wavelength,
+                layer->amplitude,
+                layer->warp_wavelength,
+                layer->warp_strength
+            );
+        }
+    }
 }
 
 static void
@@ -510,16 +542,65 @@ mat4_look_at(const float eye[3], const float center[3], const float up[3], float
     out[15] = 1.0f;
 }
 
+static void
+planet_local_basis(const AppState *state, float up[3], float east[3], float north[3]) {
+    if (!state->terrain_scene.planet.enabled) {
+        up[0] = 0.0f; up[1] = 1.0f; up[2] = 0.0f;
+        east[0] = 1.0f; east[1] = 0.0f; east[2] = 0.0f;
+        north[0] = 0.0f; north[1] = 0.0f; north[2] = 1.0f;
+        return;
+    }
+    const TerrainPlanetConfig *planet = &state->terrain_scene.planet;
+    up[0] = state->camera_position[0] - planet->origin[0];
+    up[1] = state->camera_position[1] - planet->origin[1];
+    up[2] = state->camera_position[2] - planet->origin[2];
+    vec3_normalize(up);
+
+    float reference[3] = {0.0f, 1.0f, 0.0f};
+    if (fabsf(vec3_dot(up, reference)) > 0.94f) {
+        reference[0] = 1.0f;
+        reference[1] = 0.0f;
+        reference[2] = 0.0f;
+    }
+    vec3_cross(reference, up, east);
+    vec3_normalize(east);
+    vec3_cross(up, east, north);
+    vec3_normalize(north);
+}
+
+static void
+camera_forward_up(const AppState *state, float forward[3], float up[3]) {
+    if (state->terrain_scene.planet.enabled) {
+        float east[3] = {0};
+        float north[3] = {0};
+        planet_local_basis(state, up, east, north);
+        const float heading[3] = {
+            east[0] * sinf(state->camera_yaw) + north[0] * cosf(state->camera_yaw),
+            east[1] * sinf(state->camera_yaw) + north[1] * cosf(state->camera_yaw),
+            east[2] * sinf(state->camera_yaw) + north[2] * cosf(state->camera_yaw),
+        };
+        const float cp = cosf(state->camera_pitch);
+        forward[0] = heading[0] * cp + up[0] * sinf(state->camera_pitch);
+        forward[1] = heading[1] * cp + up[1] * sinf(state->camera_pitch);
+        forward[2] = heading[2] * cp + up[2] * sinf(state->camera_pitch);
+        vec3_normalize(forward);
+        return;
+    }
+
+    forward[0] = cosf(state->camera_pitch) * sinf(state->camera_yaw);
+    forward[1] = sinf(state->camera_pitch);
+    forward[2] = cosf(state->camera_pitch) * cosf(state->camera_yaw);
+    up[0] = 0.0f;
+    up[1] = 1.0f;
+    up[2] = 0.0f;
+}
+
 static CameraUniform
 make_camera_uniform(const AppState *state, uint32_t width, uint32_t height) {
     const float aspect = height == 0u ? 1.0f : (float)width / (float)height;
-    const float yaw = state->camera_yaw;
-    const float pitch = state->camera_pitch;
-    const float forward[3] = {
-        cosf(pitch) * sinf(yaw),
-        sinf(pitch),
-        cosf(pitch) * cosf(yaw),
-    };
+    float forward[3] = {0};
+    float world_up[3] = {0};
+    camera_forward_up(state, forward, world_up);
     const float center[3] = {
         state->camera_position[0] + forward[0],
         state->camera_position[1] + forward[1],
@@ -528,8 +609,7 @@ make_camera_uniform(const AppState *state, uint32_t width, uint32_t height) {
 
     /* Up vector banked by camera_roll about the forward axis. With roll == 0 this
      * reduces to world-up (0,1,0), so FREE/GROUND are unaffected. */
-    float up[3] = {0.0f, 1.0f, 0.0f};
-    float world_up[3] = {0.0f, 1.0f, 0.0f};
+    float up[3] = {world_up[0], world_up[1], world_up[2]};
     float right[3] = {0};
     vec3_cross(forward, world_up, right);
     if (vec3_dot(right, right) > 0.000001f) {
@@ -547,7 +627,8 @@ make_camera_uniform(const AppState *state, uint32_t width, uint32_t height) {
     float view[16] = {0};
     CameraUniform camera = {0};
 
-    mat4_perspective(state->camera_fov_degrees * 3.1415926535f / 180.0f, aspect, CAM_NEAR_Z, CAM_FAR_Z, projection);
+    const float far_z = state->terrain_scene.planet.enabled ? CAM_PLANET_FAR_Z : CAM_FLAT_FAR_Z;
+    mat4_perspective(state->camera_fov_degrees * 3.1415926535f / 180.0f, aspect, CAM_NEAR_Z, far_z, projection);
     mat4_look_at(state->camera_position, center, up, view);
     mat4_mul(projection, view, camera.view_projection);
     return camera;
@@ -799,6 +880,35 @@ create_hud_buffers(AppState *state) {
     return true;
 }
 
+static bool
+create_planet_buffers(AppState *state) {
+    if (sizeof(TerrainPlanetVertex) != sizeof(TerrainMeshVertex)) {
+        log_error("Planet vertex layout does not match terrain vertex layout");
+        return false;
+    }
+    SDL_GPUBufferCreateInfo buffer_info = {
+        .usage = SDL_GPU_BUFFERUSAGE_VERTEX,
+        .size = TERRAIN_PLANET_MAX_VERTICES * (uint32_t)sizeof(TerrainPlanetVertex),
+    };
+    state->planet_vertex_buffer = SDL_CreateGPUBuffer(state->device, &buffer_info);
+    if (state->planet_vertex_buffer == NULL) {
+        log_error("Could not create planet vertex buffer: %s", SDL_GetError());
+        return false;
+    }
+    SDL_SetGPUBufferName(state->device, state->planet_vertex_buffer, "planet vertices");
+
+    SDL_GPUTransferBufferCreateInfo transfer_info = {
+        .usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
+        .size = TERRAIN_PLANET_MAX_VERTICES * (uint32_t)sizeof(TerrainPlanetVertex),
+    };
+    state->planet_transfer_buffer = SDL_CreateGPUTransferBuffer(state->device, &transfer_info);
+    if (state->planet_transfer_buffer == NULL) {
+        log_error("Could not create planet transfer buffer: %s", SDL_GetError());
+        return false;
+    }
+    return true;
+}
+
 static uint8_t
 glyph_row(char c, int row) {
     static const uint8_t digits[10][7] = {
@@ -919,6 +1029,69 @@ hud_emit_text(HudVertex *vertices, uint32_t *count, float x, float y, float scal
 }
 
 static float find_ground_y(const TerrainWorld *world, float x, float z);
+static float planet_camera_altitude(const AppState *state);
+
+static bool
+build_and_upload_planet(AppState *state, SDL_GPUCommandBuffer *command_buffer, uint32_t height) {
+    state->planet_vertex_count = 0u;
+    state->planet_patch_count = 0u;
+    state->dbg_planet_vertices = 0u;
+    state->dbg_planet_patches = 0u;
+    if (!state->terrain_scene.planet.enabled) {
+        return true;
+    }
+
+    TerrainPlanetPatchKey patches[TERRAIN_PLANET_MAX_PATCHES];
+    const TerrainPlanetView view = {
+        .camera = {state->camera_position[0], state->camera_position[1], state->camera_position[2]},
+        .fov_degrees = state->camera_fov_degrees,
+        .viewport_height = (float)height,
+        .max_lod = 14u,
+    };
+    const size_t patch_count = terrain_planet_select_patches(
+        &state->terrain_scene.planet,
+        &view,
+        patches,
+        TERRAIN_PLANET_MAX_PATCHES
+    );
+
+    TerrainPlanetVertex *vertices = SDL_MapGPUTransferBuffer(state->device, state->planet_transfer_buffer, true);
+    if (vertices == NULL) {
+        log_error("Could not map planet transfer buffer: %s", SDL_GetError());
+        return false;
+    }
+    const size_t vertex_count = terrain_planet_emit_mesh(
+        &state->terrain_scene.planet,
+        &view,
+        patches,
+        patch_count,
+        vertices,
+        TERRAIN_PLANET_MAX_VERTICES
+    );
+    SDL_UnmapGPUTransferBuffer(state->device, state->planet_transfer_buffer);
+
+    state->planet_patch_count = (uint32_t)patch_count;
+    state->planet_vertex_count = (uint32_t)vertex_count;
+    state->dbg_planet_patches = state->planet_patch_count;
+    state->dbg_planet_vertices = state->planet_vertex_count;
+    if (vertex_count == 0u) {
+        return true;
+    }
+
+    SDL_GPUCopyPass *copy_pass = SDL_BeginGPUCopyPass(command_buffer);
+    SDL_GPUTransferBufferLocation location = {
+        .transfer_buffer = state->planet_transfer_buffer,
+        .offset = 0u,
+    };
+    SDL_GPUBufferRegion region = {
+        .buffer = state->planet_vertex_buffer,
+        .offset = 0u,
+        .size = (uint32_t)(vertex_count * sizeof(TerrainPlanetVertex)),
+    };
+    SDL_UploadToGPUBuffer(copy_pass, &location, &region, true);
+    SDL_EndGPUCopyPass(copy_pass);
+    return true;
+}
 
 static bool
 build_and_upload_hud(AppState *state, SDL_GPUCommandBuffer *command_buffer) {
@@ -943,22 +1116,36 @@ build_and_upload_hud(AppState *state, SDL_GPUCommandBuffer *command_buffer) {
         state->camera_mode == CAM_FLIGHT ? "FLIGHT" :
         state->camera_mode == CAM_GROUND ? "GROUND" : "FREE";
     if (state->camera_mode == CAM_FLIGHT) {
-        SDL_snprintf(line, sizeof(line), "MODE %s  SPEED %.0f  [TAB]", mode_name, state->flight_speed);
+        if (state->terrain_scene.planet.enabled) {
+            SDL_snprintf(line, sizeof(line), "MODE %s  SPEED %.0f ALT %.0f  [TAB]", mode_name, state->flight_speed, planet_camera_altitude(state));
+        } else {
+            SDL_snprintf(line, sizeof(line), "MODE %s  SPEED %.0f  [TAB]", mode_name, state->flight_speed);
+        }
     } else {
         SDL_snprintf(line, sizeof(line), "MODE %s  [TAB]", mode_name);
     }
     hud_emit_text(vertices, &count, x, y, scale, line);
     y += line_step;
 
-    SDL_snprintf(
-        line,
-        sizeof(line),
-        "FRESH%u SEAM%u SKIP%u PIPE%u",
-        state->dbg_fresh_generated,
-        state->dbg_seam_only_changes,
-        state->dbg_seam_refreshes_skipped,
-        state->dbg_pipeline_recreates
-    );
+    if (state->terrain_scene.planet.enabled) {
+        SDL_snprintf(
+            line,
+            sizeof(line),
+            "PLANET PATCH%u VERT%u",
+            state->dbg_planet_patches,
+            state->dbg_planet_vertices
+        );
+    } else {
+        SDL_snprintf(
+            line,
+            sizeof(line),
+            "FRESH%u SEAM%u SKIP%u PIPE%u",
+            state->dbg_fresh_generated,
+            state->dbg_seam_only_changes,
+            state->dbg_seam_refreshes_skipped,
+            state->dbg_pipeline_recreates
+        );
+    }
     hud_emit_text(vertices, &count, x, y, scale, line);
     y += line_step;
 
@@ -976,16 +1163,27 @@ build_and_upload_hud(AppState *state, SDL_GPUCommandBuffer *command_buffer) {
     hud_emit_text(vertices, &count, x, y, scale, line);
     y += line_step;
 
-    SDL_snprintf(
-        line,
-        sizeof(line),
-        "SEED %u HEIGHT %.0f %.0f BASE %.0f AMP %.1f",
-        state->terrain_config.seed,
-        state->terrain_config.min_height,
-        state->terrain_config.max_height,
-        state->terrain_config.base_height,
-        state->terrain_config.noise_amplitude
-    );
+    if (state->terrain_scene.planet.enabled) {
+        SDL_snprintf(
+            line,
+            sizeof(line),
+            "PLANET R %.0f MAXH %.0f LAYERS %u",
+            state->terrain_scene.planet.radius,
+            state->terrain_scene.planet.max_height,
+            state->terrain_scene.planet.layer_count
+        );
+    } else {
+        SDL_snprintf(
+            line,
+            sizeof(line),
+            "SEED %u HEIGHT %.0f %.0f BASE %.0f AMP %.1f",
+            state->terrain_config.seed,
+            state->terrain_config.min_height,
+            state->terrain_config.max_height,
+            state->terrain_config.base_height,
+            state->terrain_config.noise_amplitude
+        );
+    }
     hud_emit_text(vertices, &count, x, y, scale, line);
     y += line_step;
 
@@ -1044,7 +1242,7 @@ build_and_upload_hud(AppState *state, SDL_GPUCommandBuffer *command_buffer) {
     hud_emit_text(vertices, &count, x, y, scale, line);
     y += line_step;
 
-    if (state->camera_mode == CAM_GROUND) {
+    if (state->camera_mode == CAM_GROUND && !state->terrain_scene.planet.enabled) {
         const float floor_y = find_ground_y(
             &state->terrain_world,
             state->camera_position[0],
@@ -1223,7 +1421,7 @@ reload_scene(AppState *state, bool force) {
         return false;
     }
 
-    const uint32_t old_density = terrain_density_hash(&state->terrain_world.base);
+    const uint32_t old_density = state->terrain_scene.density_hash;
     const uint32_t old_material = state->terrain_scene.material_hash;
     const uint32_t old_graph = state->terrain_scene.graph_hash;
     apply_scene(state, &next, true);
@@ -1231,7 +1429,7 @@ reload_scene(AppState *state, bool force) {
     state->scene_mtime_ns = mtime;
     state->last_reload_check_ms = SDL_GetTicks();
     state->reload_frame = state->frame_count;
-    state->reload_hash = terrain_density_hash(&state->terrain_world.base);
+    state->reload_hash = state->terrain_scene.density_hash;
     snprintf(state->reload_status, sizeof(state->reload_status), "OK");
     state->reload_error[0] = '\0';
     state->reload_invalidated_chunks =
@@ -1607,6 +1805,19 @@ chunk_system_render(AppState *state, SDL_GPURenderPass *render_pass) {
     }
 }
 
+static void
+planet_render(AppState *state, SDL_GPURenderPass *render_pass) {
+    if (!state->terrain_scene.planet.enabled || state->planet_vertex_count == 0u) {
+        return;
+    }
+    SDL_GPUBufferBinding binding = {
+        .buffer = state->planet_vertex_buffer,
+        .offset = 0u,
+    };
+    SDL_BindGPUVertexBuffers(render_pass, 0u, &binding, 1u);
+    SDL_DrawGPUPrimitives(render_pass, state->planet_vertex_count, 1u, 0u, 0u);
+}
+
 /* Find the terrain surface height at (x, z) by locating the SDF zero-crossing of
  * terrain_density_sample (the same field the visible mesh is built from). The SDF
  * is negative inside solid terrain and positive in air. No chunk data is required,
@@ -1639,6 +1850,31 @@ find_ground_y(const TerrainWorld *world, float x, float z) {
  * by SDL_AppInit and the R key. */
 static void
 reset_camera(AppState *state) {
+    if (state->terrain_scene.planet.enabled) {
+        const TerrainPlanetConfig *planet = &state->terrain_scene.planet;
+        const float z = planet->radius * 1.85f;
+        const float y = planet->radius * 0.32f;
+        state->camera_position[0] = planet->origin[0];
+        state->camera_position[1] = planet->origin[1] + y;
+        state->camera_position[2] = planet->origin[2] + z;
+        state->camera_yaw = 3.1415926535f;
+        state->camera_pitch = -atan2f(y, z);
+        state->camera_fov_degrees = 60.0f;
+        state->camera_roll = 0.0f;
+        state->flight_speed = 0.0f;
+        state->velocity_y = 0.0f;
+        state->camera_mode = CAM_FLIGHT;
+        log_info(
+            "Planet camera reset: pos %.1f %.1f %.1f radius %.1f layers %u",
+            state->camera_position[0],
+            state->camera_position[1],
+            state->camera_position[2],
+            planet->radius,
+            planet->layer_count
+        );
+        return;
+    }
+
     const float x = chunk_region_extent() * 0.5f;
     const float z = chunk_region_extent() * 0.5f - 78.0f;
     const float ground_y = find_ground_y(&state->terrain_world, x, z);
@@ -1711,6 +1947,29 @@ update_camera_free(AppState *state, float dt) {
     }
 }
 
+static float
+planet_camera_altitude(const AppState *state) {
+    if (!state->terrain_scene.planet.enabled) {
+        return 0.0f;
+    }
+    const TerrainPlanetConfig *planet = &state->terrain_scene.planet;
+    const float rel[3] = {
+        state->camera_position[0] - planet->origin[0],
+        state->camera_position[1] - planet->origin[1],
+        state->camera_position[2] - planet->origin[2],
+    };
+    return sqrtf(vec3_dot(rel, rel)) - planet->radius;
+}
+
+static float
+planet_flight_scale(const AppState *state) {
+    if (!state->terrain_scene.planet.enabled) {
+        return 1.0f;
+    }
+    const float altitude = fmaxf(planet_camera_altitude(state), 0.0f);
+    return clampf(altitude / 1800.0f, 1.0f, 80.0f);
+}
+
 /* FLIGHT: airplane-style camera. W/S throttle, A/D yaw turn, up/down pitch,
  * left/right bank (roll). Moves along the full 3D facing direction. */
 static void
@@ -1721,13 +1980,18 @@ update_camera_flight(AppState *state, float dt) {
         return;
     }
 
+    const float speed_scale = planet_flight_scale(state);
+    const float accel = state->terrain_scene.planet.enabled ? CAM_PLANET_FLIGHT_ACCEL * speed_scale : CAM_FLIGHT_ACCEL;
+    const float min_speed = state->terrain_scene.planet.enabled ? CAM_PLANET_FLIGHT_SPEED_MIN * speed_scale : CAM_FLIGHT_SPEED_MIN;
+    const float max_speed = state->terrain_scene.planet.enabled ? CAM_PLANET_FLIGHT_SPEED_MAX * speed_scale : CAM_FLIGHT_SPEED_MAX;
+
     if (SDL_SCANCODE_W < key_count && keys[SDL_SCANCODE_W]) {
-        state->flight_speed += CAM_FLIGHT_ACCEL * dt;
+        state->flight_speed += accel * dt;
     }
     if (SDL_SCANCODE_S < key_count && keys[SDL_SCANCODE_S]) {
-        state->flight_speed -= CAM_FLIGHT_ACCEL * dt;
+        state->flight_speed -= accel * dt;
     }
-    state->flight_speed = clampf(state->flight_speed, CAM_FLIGHT_SPEED_MIN, CAM_FLIGHT_SPEED_MAX);
+    state->flight_speed = clampf(state->flight_speed, min_speed, max_speed);
 
     if (SDL_SCANCODE_A < key_count && keys[SDL_SCANCODE_A]) {
         state->camera_yaw += CAM_FLIGHT_TURN * dt;
@@ -1751,12 +2015,9 @@ update_camera_flight(AppState *state, float dt) {
     }
     state->camera_roll = clampf(state->camera_roll, -CAM_FLIGHT_ROLL_MAX, CAM_FLIGHT_ROLL_MAX);
 
-    const float cp = cosf(state->camera_pitch);
-    const float forward[3] = {
-        cp * sinf(state->camera_yaw),
-        sinf(state->camera_pitch),
-        cp * cosf(state->camera_yaw),
-    };
+    float forward[3] = {0};
+    float up[3] = {0};
+    camera_forward_up(state, forward, up);
     state->camera_position[0] += forward[0] * state->flight_speed * dt;
     state->camera_position[1] += forward[1] * state->flight_speed * dt;
     state->camera_position[2] += forward[2] * state->flight_speed * dt;
@@ -1769,6 +2030,47 @@ update_camera_ground(AppState *state, float dt) {
     int key_count = 0;
     const bool *keys = SDL_GetKeyboardState(&key_count);
     if (keys == NULL) {
+        return;
+    }
+
+    if (state->terrain_scene.planet.enabled) {
+        if (SDL_SCANCODE_A < key_count && keys[SDL_SCANCODE_A]) {
+            state->camera_yaw += CAM_GROUND_TURN * dt;
+        }
+        if (SDL_SCANCODE_D < key_count && keys[SDL_SCANCODE_D]) {
+            state->camera_yaw -= CAM_GROUND_TURN * dt;
+        }
+
+        float up[3] = {0};
+        float east[3] = {0};
+        float north[3] = {0};
+        planet_local_basis(state, up, east, north);
+        const float forward[3] = {
+            east[0] * sinf(state->camera_yaw) + north[0] * cosf(state->camera_yaw),
+            east[1] * sinf(state->camera_yaw) + north[1] * cosf(state->camera_yaw),
+            east[2] * sinf(state->camera_yaw) + north[2] * cosf(state->camera_yaw),
+        };
+
+        float move = 0.0f;
+        if (SDL_SCANCODE_W < key_count && keys[SDL_SCANCODE_W]) {
+            move += 1.0f;
+        }
+        if (SDL_SCANCODE_S < key_count && keys[SDL_SCANCODE_S]) {
+            move -= 1.0f;
+        }
+        const TerrainPlanetConfig *planet = &state->terrain_scene.planet;
+        const float radius = fmaxf(planet_camera_altitude(state) + planet->radius, planet->radius + 1.0f);
+        float dir[3] = {
+            up[0] + forward[0] * move * CAM_GROUND_SPEED * dt / radius,
+            up[1] + forward[1] * move * CAM_GROUND_SPEED * dt / radius,
+            up[2] + forward[2] * move * CAM_GROUND_SPEED * dt / radius,
+        };
+        vec3_normalize(dir);
+        const float surface_r = terrain_planet_surface_radius(planet, dir, 1.0f) + CAM_EYE_HEIGHT;
+        state->camera_position[0] = planet->origin[0] + dir[0] * surface_r;
+        state->camera_position[1] = planet->origin[1] + dir[1] * surface_r;
+        state->camera_position[2] = planet->origin[2] + dir[2] * surface_r;
+        state->velocity_y = 0.0f;
         return;
     }
 
@@ -1908,6 +2210,9 @@ SDL_AppInit(void **appstate, int argc, char *argv[]) {
     if (!create_hud_buffers(state)) {
         return SDL_APP_FAILURE;
     }
+    if (!create_planet_buffers(state)) {
+        return SDL_APP_FAILURE;
+    }
     if (!initialize_terrain(state)) {
         return SDL_APP_FAILURE;
     }
@@ -1939,7 +2244,9 @@ SDL_AppIterate(void *appstate) {
         }
     }
     update_camera(state, dt);
-    chunk_system_update(state);
+    if (!state->terrain_scene.planet.enabled) {
+        chunk_system_update(state);
+    }
 
     SDL_GPUCommandBuffer *command_buffer = SDL_AcquireGPUCommandBuffer(state->device);
 
@@ -1953,6 +2260,10 @@ SDL_AppIterate(void *appstate) {
     }
 
     if (!ensure_depth_texture(state, width, height)) {
+        SDL_SubmitGPUCommandBuffer(command_buffer);
+        return SDL_APP_FAILURE;
+    }
+    if (!build_and_upload_planet(state, command_buffer, height)) {
         SDL_SubmitGPUCommandBuffer(command_buffer);
         return SDL_APP_FAILURE;
     }
@@ -1993,7 +2304,11 @@ SDL_AppIterate(void *appstate) {
         {.texture = state->material_normal, .sampler = state->material_sampler},
     };
     SDL_BindGPUFragmentSamplers(render_pass, 0u, material_bindings, 2u);
-    chunk_system_render(state, render_pass);
+    if (state->terrain_scene.planet.enabled) {
+        planet_render(state, render_pass);
+    } else {
+        chunk_system_render(state, render_pass);
+    }
 
     HudUniform hud = {
         .viewport = {(float)width, (float)height, 0.0f, 0.0f},
@@ -2017,6 +2332,28 @@ SDL_AppEvent(void *appstate, SDL_Event *event) {
         return SDL_APP_SUCCESS;
     }
     if (event->type == SDL_EVENT_MOUSE_MOTION) {
+        if (state->terrain_scene.planet.enabled && (event->motion.state & SDL_BUTTON_MMASK) != 0u) {
+            const TerrainPlanetConfig *planet = &state->terrain_scene.planet;
+            float dir[3] = {
+                state->camera_position[0] - planet->origin[0],
+                state->camera_position[1] - planet->origin[1],
+                state->camera_position[2] - planet->origin[2],
+            };
+            float radius = sqrtf(vec3_dot(dir, dir));
+            if (radius > 0.0001f) {
+                dir[0] /= radius;
+                dir[1] /= radius;
+                dir[2] /= radius;
+                const float altitude = fmaxf(radius - planet->radius, 0.0f);
+                const float drag_scale = clampf(altitude * 0.01f, 8.0f, 900.0f);
+                radius = fmaxf(radius - event->motion.yrel * drag_scale, planet->radius + CAM_EYE_HEIGHT);
+                state->camera_position[0] = planet->origin[0] + dir[0] * radius;
+                state->camera_position[1] = planet->origin[1] + dir[1] * radius;
+                state->camera_position[2] = planet->origin[2] + dir[2] * radius;
+            }
+            return SDL_APP_CONTINUE;
+        }
+
         /* MMB height nudge is a FREE-mode convenience only. */
         if (state->camera_mode == CAM_FREE && (event->motion.state & SDL_BUTTON_MMASK) != 0u) {
             const float min_y = state->terrain_config.min_height - 256.0f;
@@ -2054,7 +2391,20 @@ SDL_AppEvent(void *appstate, SDL_Event *event) {
                 state->flight_speed = 0.0f;
                 state->velocity_y = 0.0f;
                 state->camera_roll = 0.0f;
-                if (state->camera_mode == CAM_GROUND) {
+                if (state->camera_mode == CAM_GROUND && state->terrain_scene.planet.enabled) {
+                    const TerrainPlanetConfig *planet = &state->terrain_scene.planet;
+                    float dir[3] = {
+                        state->camera_position[0] - planet->origin[0],
+                        state->camera_position[1] - planet->origin[1],
+                        state->camera_position[2] - planet->origin[2],
+                    };
+                    vec3_normalize(dir);
+                    const float surface_r = terrain_planet_surface_radius(planet, dir, 1.0f) + CAM_EYE_HEIGHT;
+                    state->camera_position[0] = planet->origin[0] + dir[0] * surface_r;
+                    state->camera_position[1] = planet->origin[1] + dir[1] * surface_r;
+                    state->camera_position[2] = planet->origin[2] + dir[2] * surface_r;
+                    state->camera_pitch = 0.0f;
+                } else if (state->camera_mode == CAM_GROUND) {
                     /* Drop the view to just above the surface immediately. */
                     state->camera_position[1] = find_ground_y(
                         &state->terrain_world,
@@ -2263,6 +2613,12 @@ SDL_AppQuit(void *appstate, SDL_AppResult result) {
         }
         if (state->hud_transfer_buffer != NULL) {
             SDL_ReleaseGPUTransferBuffer(state->device, state->hud_transfer_buffer);
+        }
+        if (state->planet_vertex_buffer != NULL) {
+            SDL_ReleaseGPUBuffer(state->device, state->planet_vertex_buffer);
+        }
+        if (state->planet_transfer_buffer != NULL) {
+            SDL_ReleaseGPUTransferBuffer(state->device, state->planet_transfer_buffer);
         }
         if (state->hud_vertex_buffer != NULL) {
             SDL_ReleaseGPUBuffer(state->device, state->hud_vertex_buffer);

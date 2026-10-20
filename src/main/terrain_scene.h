@@ -33,6 +33,7 @@ typedef struct TerrainScene {
     TerrainSceneHeight height;
     TerrainMaterialDefaults material;
     TerrainWorld world_data;
+    TerrainPlanetConfig planet;
     uint32_t density_hash;
     uint32_t material_hash;
     uint32_t graph_hash;

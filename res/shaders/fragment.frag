@@ -43,6 +43,23 @@ vec3 sample_normal(float layer, vec3 p, vec3 n, vec3 w) {
 
 void main()
 {
+    if (v_material.x < -0.5) {
+        vec3 geo_n = normalize(v_normal);
+        vec3 radial = normalize(v_world_pos);
+        float face = clamp(dot(geo_n, radial), 0.0, 1.0);
+        float grade = smoothstep(0.15, 0.95, face);
+        vec3 side_rock = vec3(0.42, 0.36, 0.30);
+        vec3 top_rock = vec3(0.58, 0.56, 0.50);
+        vec3 albedo = mix(side_rock, top_rock, grade);
+
+        vec3 l = normalize(light.sun_dir.xyz);
+        float ndotl = max(dot(geo_n, l), 0.0);
+        vec3 lit = light.ambient.rgb + light.sun_color.rgb * ndotl;
+        vec3 color = pow(albedo * lit, vec3(1.0 / 2.2));
+        FragColor = vec4(color, 1.0);
+        return;
+    }
+
     /* Resolve logical material ids (0 = flat, 1 = slope) into the active palette's
      * texture-array layers: layer = palette_base + logical_id. */
     float palette_base = light.params.z;

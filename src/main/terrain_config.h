@@ -17,6 +17,7 @@
 #define TERRAIN_MAX_ACTIVE_REGIONS 16
 #define TERRAIN_MAX_REGION_INFLUENCES 8
 #define TERRAIN_MAX_REGION_POINTS 8
+#define TERRAIN_MAX_PLANET_LAYERS 16
 
 typedef struct TerrainAabb3 {
     float min[3];
@@ -186,6 +187,24 @@ typedef struct TerrainHeightBounds {
     int32_t min_y;
     int32_t max_y;
 } TerrainHeightBounds;
+
+typedef struct TerrainPlanetLayer {
+    char name[32];
+    float wavelength;
+    float amplitude;
+    float warp_wavelength;
+    float warp_strength;
+} TerrainPlanetLayer;
+
+typedef struct TerrainPlanetConfig {
+    bool enabled;
+    uint32_t seed;
+    float origin[3];
+    float radius;
+    float max_height;
+    uint32_t layer_count;
+    TerrainPlanetLayer layers[TERRAIN_MAX_PLANET_LAYERS];
+} TerrainPlanetConfig;
 
 uint32_t terrain_hash_u32(uint32_t x);
 uint32_t terrain_hash_f32(uint32_t acc, float value);

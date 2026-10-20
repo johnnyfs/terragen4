@@ -8,6 +8,7 @@
 
 #include "chunk_coord.h"
 #include "materials.h"
+#include "terrain_planet.h"
 
 typedef enum ParseSection {
     SECTION_NONE,
@@ -19,6 +20,9 @@ typedef enum ParseSection {
     SECTION_OCTAVES,
     SECTION_WARP,
     SECTION_MATERIAL,
+    SECTION_PLANET,
+    SECTION_PLANET_LAYERS,
+    SECTION_PLANET_LAYER_WARP,
     SECTION_REGIONS,
     SECTION_GEOMETRY,
     SECTION_POINTS,
@@ -409,6 +413,13 @@ terrain_scene_default(void) {
     snprintf(scene.material.default_vibe, sizeof(scene.material.default_vibe), "Meadow");
     snprintf(scene.material.default_flat_material, sizeof(scene.material.default_flat_material), "grass");
     snprintf(scene.material.default_slope_material, sizeof(scene.material.default_slope_material), "stone");
+    scene.planet = (TerrainPlanetConfig) {
+        .enabled = false,
+        .seed = 1337u,
+        .origin = {0.0f, 0.0f, 0.0f},
+        .radius = 64000.0f,
+        .max_height = 0.0f,
+    };
     terrain_world_init(&scene.world_data, &scene.world_data.base);
     terrain_world_add_demo_features(&scene.world_data, chunk_region_extent() * 0.5f, chunk_region_extent() * 0.5f);
     scene.density_hash = terrain_density_hash(&scene.world_data.base);
@@ -447,6 +458,38 @@ validate_and_compile(TerrainScene *scene, char *error, size_t error_size) {
     if (config->warp_frequency < 0.0f) {
         set_error(error, error_size, "invalid warp frequency");
         return false;
+    }
+    if (scene->planet.enabled) {
+        if (!isfinite(scene->planet.radius) || scene->planet.radius <= 0.0f) {
+            set_error(error, error_size, "invalid planet radius");
+            return false;
+        }
+        if (scene->planet.layer_count == 0u) {
+            set_error(error, error_size, "planet requires at least one layer");
+            return false;
+        }
+        float max_height = 0.0f;
+        for (uint32_t i = 0u; i < scene->planet.layer_count && i < TERRAIN_MAX_PLANET_LAYERS; i += 1u) {
+            TerrainPlanetLayer *layer = &scene->planet.layers[i];
+            if (layer->name[0] == '\0') {
+                snprintf(layer->name, sizeof(layer->name), "layer_%u", i);
+            }
+            if (!isfinite(layer->wavelength) || layer->wavelength <= 0.0f ||
+                !isfinite(layer->amplitude) ||
+                layer->warp_wavelength < 0.0f ||
+                !isfinite(layer->warp_strength)) {
+                set_error(error, error_size, "invalid planet layer");
+                return false;
+            }
+            max_height += fabsf(layer->amplitude);
+            if (layer->warp_strength != 0.0f && layer->warp_wavelength <= 0.0f) {
+                set_error(error, error_size, "planet layer warp requires wavelength");
+                return false;
+            }
+        }
+        if (scene->planet.max_height <= 0.0f) {
+            scene->planet.max_height = max_height;
+        }
     }
     if (scene->world.chunk_cells != 0u && scene->world.chunk_cells != CHUNK_CELLS) {
         set_error(error, error_size, "scene.world.chunk_cells must match compile-time CHUNK_CELLS");
@@ -549,6 +592,9 @@ validate_and_compile(TerrainScene *scene, char *error, size_t error_size) {
     }
 
     scene->density_hash = terrain_density_hash(config);
+    if (scene->planet.enabled) {
+        scene->density_hash ^= terrain_planet_hash(&scene->planet);
+    }
     scene->graph_hash = 2166136261u;
     for (uint32_t i = 0u; i < scene->world_data.region_count; i += 1u) {
         scene->world_data.regions[i].content_hash = hash_region_content(&scene->world_data.regions[i]);
@@ -582,6 +628,7 @@ terrain_scene_load_yaml(const char *path, TerrainScene *out_scene, char *error, 
     TerrainRegionNode *region = NULL;
     TerrainRegionInfluence *influence = NULL;
     TerrainNoiseOctave *octave = NULL;
+    TerrainPlanetLayer *planet_layer = NULL;
     bool explicit_base_height = false;
     bool explicit_legacy_amplitude = false;
     char line_storage[512];
@@ -603,12 +650,16 @@ terrain_scene_load_yaml(const char *path, TerrainScene *out_scene, char *error, 
             section != SECTION_GEOMETRY &&
             section != SECTION_POINTS &&
             section != SECTION_TRANSITION &&
-            section != SECTION_INFLUENCES) {
+            section != SECTION_INFLUENCES &&
+            section != SECTION_PLANET &&
+            section != SECTION_PLANET_LAYERS &&
+            section != SECTION_PLANET_LAYER_WARP) {
             if (str_eq(line, "world:")) { section = SECTION_WORLD; continue; }
             if (str_eq(line, "height:")) { section = SECTION_HEIGHT; continue; }
             if (str_eq(line, "noise:")) { section = SECTION_NOISE; octave = NULL; continue; }
             if (str_eq(line, "warp:")) { section = SECTION_WARP; continue; }
             if (str_eq(line, "material:")) { section = SECTION_MATERIAL; continue; }
+            if (str_eq(line, "planet:")) { section = SECTION_PLANET; scene.planet.enabled = true; planet_layer = NULL; continue; }
         }
 
         if (section == SECTION_SCENE) {
@@ -617,8 +668,66 @@ terrain_scene_load_yaml(const char *path, TerrainScene *out_scene, char *error, 
             if (str_eq(line, "noise:")) { section = SECTION_NOISE; continue; }
             if (str_eq(line, "warp:")) { section = SECTION_WARP; continue; }
             if (str_eq(line, "material:")) { section = SECTION_MATERIAL; continue; }
+            if (str_eq(line, "planet:")) { section = SECTION_PLANET; scene.planet.enabled = true; planet_layer = NULL; continue; }
             if (strncmp(line, "id:", 3) == 0) { copy_value(scene.id, sizeof(scene.id), value_after_colon(line)); continue; }
             if (strncmp(line, "name:", 5) == 0) { copy_value(scene.name, sizeof(scene.name), value_after_colon(line)); continue; }
+        }
+
+        if (section == SECTION_PLANET || section == SECTION_PLANET_LAYERS || section == SECTION_PLANET_LAYER_WARP) {
+            if (str_eq(line, "world:")) { section = SECTION_WORLD; continue; }
+            if (str_eq(line, "height:")) { section = SECTION_HEIGHT; continue; }
+            if (str_eq(line, "noise:")) { section = SECTION_NOISE; octave = NULL; continue; }
+            if (str_eq(line, "material:")) { section = SECTION_MATERIAL; continue; }
+            if (str_eq(line, "regions:")) { section = SECTION_REGIONS; continue; }
+            if (str_eq(line, "layers:")) { section = SECTION_PLANET_LAYERS; planet_layer = NULL; continue; }
+            if (section == SECTION_PLANET_LAYERS && strncmp(line, "- name:", 7) == 0) {
+                if (scene.planet.layer_count >= TERRAIN_MAX_PLANET_LAYERS) {
+                    fclose(f);
+                    set_error(error, error_size, "too many planet layers");
+                    return false;
+                }
+                planet_layer = &scene.planet.layers[scene.planet.layer_count++];
+                *planet_layer = (TerrainPlanetLayer){0};
+                copy_value(planet_layer->name, sizeof(planet_layer->name), value_after_colon(line));
+                continue;
+            }
+            if (section == SECTION_PLANET_LAYERS && str_eq(line, "warp:")) {
+                section = SECTION_PLANET_LAYER_WARP;
+                continue;
+            }
+            if (section == SECTION_PLANET_LAYER_WARP && strncmp(line, "- name:", 7) == 0) {
+                section = SECTION_PLANET_LAYERS;
+                if (scene.planet.layer_count >= TERRAIN_MAX_PLANET_LAYERS) {
+                    fclose(f);
+                    set_error(error, error_size, "too many planet layers");
+                    return false;
+                }
+                planet_layer = &scene.planet.layers[scene.planet.layer_count++];
+                *planet_layer = (TerrainPlanetLayer){0};
+                copy_value(planet_layer->name, sizeof(planet_layer->name), value_after_colon(line));
+                continue;
+            }
+
+            const char *v = value_after_colon(line);
+            if (section == SECTION_PLANET) {
+                if (strncmp(line, "enabled:", 8) == 0) { scene.planet.enabled = strstr(v, "true") != NULL; }
+                else if (strncmp(line, "seed:", 5) == 0) { parse_u32_value(v, &scene.planet.seed); }
+                else if (strncmp(line, "origin:", 7) == 0) { parse_vec3(v, scene.planet.origin); }
+                else if (strncmp(line, "radius:", 7) == 0) { parse_float_value(v, &scene.planet.radius); }
+                else if (strncmp(line, "max_height:", 11) == 0) { parse_float_value(v, &scene.planet.max_height); }
+                continue;
+            }
+            if (planet_layer != NULL && section == SECTION_PLANET_LAYERS) {
+                if (strncmp(line, "wavelength:", 11) == 0) { parse_float_value(v, &planet_layer->wavelength); }
+                else if (strncmp(line, "amplitude:", 10) == 0) { parse_float_value(v, &planet_layer->amplitude); }
+                else if (str_eq(line, "warp:")) { section = SECTION_PLANET_LAYER_WARP; }
+                continue;
+            }
+            if (planet_layer != NULL && section == SECTION_PLANET_LAYER_WARP) {
+                if (strncmp(line, "wavelength:", 11) == 0) { parse_float_value(v, &planet_layer->warp_wavelength); }
+                else if (strncmp(line, "strength:", 9) == 0) { parse_float_value(v, &planet_layer->warp_strength); }
+                continue;
+            }
         }
 
         if (section == SECTION_WORLD) {

@@ -67,14 +67,14 @@ test_scene_yaml_loads(void) {
     assert(scene.world_data.base.basis_count == 4u);
     assert(scene.world_data.base.seed == 1337u);
     assert(fabsf(scene.world_data.base.min_height - -8.0f) < 0.0001f);
-    assert(fabsf(scene.world_data.base.max_height - 18.0f) < 0.0001f);
+    assert(fabsf(scene.world_data.base.max_height - 100.0f) < 0.0001f);
     assert(fabsf(scene.world_data.base.base_height - 5.0f) < 0.0001f);
     assert(fabsf(scene.world_data.base.noise_frequency - 0.085f) < 0.0001f);
     assert(fabsf(scene.world_data.base.noise_amplitude - 13.0f) < 0.0001f);
     assert(scene.world_data.base.noise_octaves == 4u);
     assert(fabsf(scene.world_data.base.noise_lacunarity - 2.05f) < 0.0001f);
     assert(fabsf(scene.world_data.base.noise_gain - 0.48f) < 0.0001f);
-    assert(fabsf(scene.world_data.base.warp_frequency - 0.055f) < 0.0001f);
+    assert(fabsf(scene.world_data.base.warp_frequency - 0.5f) < 0.0001f);
     assert(fabsf(scene.world_data.base.warp_amount - 6.0f) < 0.0001f);
     assert(scene.density_hash != 0u);
     assert(scene.material_hash != 0u);
@@ -98,11 +98,26 @@ test_scene_regions_enter_packet(void) {
     assert(fabsf(a - b) < 0.000001f);
 }
 
+static void
+test_planet_scene_loads(void) {
+    TerrainScene scene = {0};
+    char error[160] = {0};
+    assert(terrain_scene_load_yaml("res/scenes/planet_rocky.yaml", &scene, error, sizeof(error)));
+    assert(scene.planet.enabled);
+    assert(scene.planet.layer_count == 7u);
+    assert(scene.world_data.region_count == 0u);
+    assert(fabsf(scene.planet.radius - 64000.0f) < 0.0001f);
+    assert(fabsf(scene.planet.layers[0].wavelength - 32000.0f) < 0.0001f);
+    assert(fabsf(scene.planet.layers[0].warp_strength - 6000.0f) < 0.0001f);
+    assert(scene.density_hash != 0u);
+}
+
 int
 main(void) {
     test_legacy_scene_loads_as_fallback_path();
     test_legacy_scene_derives_omitted_base_and_amplitude();
     test_scene_yaml_loads();
     test_scene_regions_enter_packet();
+    test_planet_scene_loads();
     return 0;
 }

@@ -1,0 +1,56 @@
+version: 1
+scene:
+  id: rocky_planet_test
+  name: "Rocky Planet Test"
+  planet:
+    seed: 424242
+    origin: [0, 0, 0]
+    radius: 64000
+    layers:
+    - name: continents
+      wavelength: 32000
+      amplitude: 2500
+      warp:
+        wavelength: 64000
+        strength: 6000
+    - name: mountain_ranges
+      wavelength: 8000
+      amplitude: 1200
+      warp:
+        wavelength: 16000
+        strength: 2000
+    - name: mountains
+      wavelength: 2000
+      amplitude: 450
+      warp:
+        wavelength: 4000
+        strength: 500
+    - name: hills
+      wavelength: 400
+      amplitude: 80
+      warp:
+        wavelength: 800
+        strength: 100
+    - name: outcrops
+      wavelength: 80
+      amplitude: 15
+      warp:
+        wavelength: 160
+        strength: 20
+    - name: boulders
+      wavelength: 16
+      amplitude: 3
+      warp:
+        wavelength: 32
+        strength: 4
+    - name: surface
+      wavelength: 2
+      amplitude: 0.25
+      warp:
+        wavelength: 4
+        strength: 0.3
+  material:
+    default_vibe: Mesa
+    default_flat_material: dirt_pebble
+    default_slope_material: slate_white
+regions: []

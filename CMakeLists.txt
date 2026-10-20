@@ -124,6 +124,7 @@ add_executable(terrain_scene_tests
     src/main/chunk_coord.c
     src/main/materials.c
     src/main/terrain_config.c
+    src/main/terrain_planet.c
     src/main/terrain_scene.c
 )
 target_compile_options(terrain_scene_tests PUBLIC -std=c23 -Wall -Wfloat-conversion)
@@ -131,3 +132,13 @@ target_include_directories(terrain_scene_tests PUBLIC src/main)
 target_link_libraries(terrain_scene_tests m)
 add_test(NAME terrain_scene_tests COMMAND terrain_scene_tests)
 set_tests_properties(terrain_scene_tests PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+
+add_executable(terrain_planet_tests
+    src/test/terrain_planet_tests.c
+    src/main/terrain_config.c
+    src/main/terrain_planet.c
+)
+target_compile_options(terrain_planet_tests PUBLIC -std=c23 -Wall -Wfloat-conversion)
+target_include_directories(terrain_planet_tests PUBLIC src/main)
+target_link_libraries(terrain_planet_tests m)
+add_test(NAME terrain_planet_tests COMMAND terrain_planet_tests)
